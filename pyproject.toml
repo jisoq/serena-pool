@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "serena-pool"
+version = "0.1.0"
+description = "Project-aware pooling proxy for Serena MCP servers: stdio <-> streamable-http bridge with lazy spawn, leases and an idle-TTL reaper"
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Lana Meleshkina" }]
+requires-python = ">=3.10"
+dependencies = ["httpx>=0.27"]
+keywords = ["serena", "mcp", "proxy", "pooling", "language-server-protocol"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development",
+]
+
+[project.urls]
+Homepage = "https://github.com/svetkis/serena-pool"
+
+[project.scripts]
+serena-pool = "serena_pool_proxy:main"
+
+[tool.setuptools]
+py-modules = ["serena_pool_proxy"]
