@@ -27,5 +27,8 @@ Homepage = "https://github.com/svetkis/serena-pool"
 [project.scripts]
 serena-pool = "serena_pool_proxy:main"
 
+[project.gui-scripts]
+serena-pool-tray = "serena_pool_tray:main"
+
 [tool.setuptools]
-py-modules = ["serena_pool_proxy"]
+py-modules = ["serena_pool_proxy", "serena_pool_tray"]

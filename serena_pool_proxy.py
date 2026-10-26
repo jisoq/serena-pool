@@ -23,6 +23,7 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -32,7 +33,9 @@ import tempfile
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import yaml
@@ -57,8 +60,10 @@ DEFAULT_CONFIG = {
     "request_timeout": 600,       # дедлайн одного запроса через мост, сек (0 = без дедлайна)
 }
 
-for d in (REGISTRY_DIR, LOCKS_DIR, LEASES_DIR, LOGS_DIR, CONTEXTS_DIR):
-    d.mkdir(parents=True, exist_ok=True)
+
+def initialize_pool() -> None:
+    for directory in (REGISTRY_DIR, LOCKS_DIR, LEASES_DIR, LOGS_DIR, CONTEXTS_DIR):
+        directory.mkdir(parents=True, exist_ok=True)
 
 
 def log(msg: str) -> None:
@@ -67,6 +72,7 @@ def log(msg: str) -> None:
 
 
 def load_config() -> dict:
+    initialize_pool()
     cfg = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
@@ -195,6 +201,7 @@ def resolve_project(project: str, current: Path) -> Path:
 
 def pinned_context_path(cfg: dict, key: str) -> Path:
     """Copy the configured native context and make the backend single-project."""
+    CONTEXTS_DIR.mkdir(parents=True, exist_ok=True)
     context = resolve_context(cfg)
     serena_home = Path(os.environ.get("SERENA_HOME") or Path.home() / ".serena")
     custom = Path(context).expanduser()
@@ -237,6 +244,131 @@ def norm_path(p) -> str:
     return os.path.normcase(os.path.realpath(str(p)))
 
 
+@dataclass(frozen=True)
+class ServerStatus:
+    key: str
+    project_path: str
+    context: str
+    profile: str | None
+    port: int
+    pid: int
+    state: Literal["running", "pid_unavailable", "port_unavailable"]
+
+
+@dataclass(frozen=True)
+class ProxyStatus:
+    server_key: str
+    project_path: str
+    pid: int
+    state: Literal["connected", "stale"]
+
+
+@dataclass(frozen=True)
+class PoolSnapshot:
+    observed_at: float
+    servers: tuple[ServerStatus, ...]
+    proxies: tuple[ProxyStatus, ...]
+    reaper: Literal["running", "pid_unavailable", "missing", "unreadable"]
+    issues: tuple[str, ...]
+
+    @property
+    def server_count(self) -> int:
+        return sum(server.state == "running" for server in self.servers)
+
+    @property
+    def proxy_count(self) -> int:
+        return sum(proxy.state == "connected" for proxy in self.proxies)
+
+
+def read_pool_status() -> PoolSnapshot:
+    """Observe pool-owned records without creating or changing pool state."""
+    now = time.time()
+    issues = []
+    servers = []
+    leases = {}
+
+    def records(directory):
+        try:
+            return sorted(path for path in directory.iterdir() if path.suffix == ".json")
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            issues.append(f"{directory.name}: {exc}")
+            return []
+
+    def text_field(data, field):
+        value = data[field]
+        if not isinstance(value, str) or not value or "\x00" in value:
+            raise ValueError(f"invalid {field}")
+        return value
+
+    def key_field(data):
+        key = text_field(data, "key")
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", key):
+            raise ValueError("invalid key")
+        return key
+
+    def pid_field(data, field):
+        value = data[field]
+        if type(value) is not int or not 0 < value <= 0xFFFFFFFF:
+            raise ValueError(f"invalid {field}")
+        return value
+
+    for path in records(REGISTRY_DIR):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            key = key_field(data)
+            if path.stem != key:
+                raise ValueError("key does not match registry filename")
+            project = norm_path(text_field(data, "project_path"))
+            context = text_field(data, "context")
+            profile = data.get("profile")
+            if profile is not None and not isinstance(profile, str):
+                raise ValueError("invalid profile")
+            port = data["port"]
+            if type(port) is not int or not 0 < port < 65536:
+                raise ValueError("invalid port")
+            pid = pid_field(data, "pid")
+            state = "pid_unavailable"
+            if pid_alive(pid):
+                state = "running" if tcp_alive(port, timeout=0.25) else "port_unavailable"
+            servers.append(ServerStatus(key, project, context, profile, port, pid, state))
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            issues.append(f"{path.name}: {exc}")
+
+    for path in records(LEASES_DIR):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            key = key_field(data)
+            project = norm_path(text_field(data, "project_path"))
+            pid = pid_field(data, "proxy_pid")
+            started = data["started_at"]
+            if (type(started) not in (float, int) or not math.isfinite(started)
+                    or started < 0):
+                raise ValueError("invalid started_at")
+            modified = path.stat().st_mtime
+            candidate = (started, path.name, key, project, modified)
+            if pid not in leases or candidate[:2] > leases[pid][:2]:
+                leases[pid] = candidate
+        except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as exc:
+            issues.append(f"{path.name}: {exc}")
+
+    proxies = tuple(
+        ProxyStatus(key, project, pid,
+                    "connected" if now - modified <= 90 else "stale")
+        for pid, (_, _, key, project, modified) in sorted(leases.items()) if pid_alive(pid)
+    )
+    try:
+        data = json.loads(REAPER_PATH.read_text(encoding="utf-8"))
+        reaper = "running" if pid_alive(pid_field(data, "pid")) else "pid_unavailable"
+    except FileNotFoundError:
+        reaper = "missing"
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        reaper = "unreadable"
+        issues.append(f"{REAPER_PATH.name}: {exc}")
+    return PoolSnapshot(now, tuple(servers), proxies, reaper, tuple(issues))
+
+
 def port_candidates(project_path: Path, cfg: dict):
     """Isolated backends have a separate identity from legacy switchable servers."""
     norm = norm_path(project_path)
@@ -258,6 +390,7 @@ def read_registry(key: str) -> dict | None:
 
 
 def write_registry(key: str, entry: dict) -> None:
+    REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
     (REGISTRY_DIR / f"{key}.json").write_text(
         json.dumps(entry, indent=2) + "\n", encoding="utf-8")
 
@@ -273,6 +406,7 @@ def remove_registry(key: str) -> None:
 def file_lock(key: str, timeout: float = 90.0):
     """Мьютекс на lockfile — не допускает двойного запуска одного проекта."""
     import msvcrt
+    LOCKS_DIR.mkdir(parents=True, exist_ok=True)
     f = open(LOCKS_DIR / f"{key}.lock", "a+b")
     deadline = time.time() + timeout
     try:
@@ -310,6 +444,7 @@ def _spawn_serena(project_path: Path, key: str, port: int, cfg: dict) -> dict:
         "--context", str(context_path),
         *cfg.get("extra_args", []),
     ]
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_file = open(LOGS_DIR / f"serena-{key}.log", "ab", buffering=0)
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
     proc = subprocess.Popen(
@@ -399,6 +534,7 @@ def lease_path_for(key: str, pid: int) -> Path:
 
 
 def write_lease(key: str, project_path: Path) -> Path:
+    LEASES_DIR.mkdir(parents=True, exist_ok=True)
     p = lease_path_for(key, os.getpid())
     p.write_text(json.dumps({
         "key": key, "proxy_pid": os.getpid(),
@@ -443,6 +579,7 @@ def freshest_lease_age(key: str, now: float) -> float | None:
 # --- reaper ------------------------------------------------------------------
 
 def ensure_reaper(cfg: dict) -> None:
+    initialize_pool()
     with file_lock("reaper-start"):
         try:
             if REAPER_PATH.exists():
@@ -478,6 +615,7 @@ def ensure_reaper(cfg: dict) -> None:
 
 
 def reaper_main() -> int:
+    initialize_pool()
     REAPER_PATH.write_text(json.dumps({"pid": os.getpid(), "started_at": time.time()}), encoding="utf-8")
     log("reaper started")
     while True:
@@ -858,7 +996,8 @@ def proxy_main() -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Serena pool proxy / reaper")
+    parser = argparse.ArgumentParser(description="Serena pool proxy / reaper",
+                                     epilog="Windows status observer: serena-pool-tray")
     parser.add_argument("--reaper", action="store_true", help="run idle-TTL reaper loop")
     args = parser.parse_args()
     if args.reaper:
