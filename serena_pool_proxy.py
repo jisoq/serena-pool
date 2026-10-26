@@ -3,35 +3,39 @@
 
 Режим по умолчанию: stdio <-> streamable-http мост.
   - определяет корень проекта по cwd (.serena/project.yml или .git вверх, fallback cwd)
-  - детерминированный порт по md5(пути + контекста) + file-lock против двойного запуска
+  - детерминированный порт по md5(пути + контекста + профиля) + file-lock против двойного запуска
   - лениво поднимает `serena start-mcp-server --transport streamable-http --project <path>`
   - контекст берётся из SERENA_POOL_CONTEXT (перекрывает config.json): один и тот же
     проект может держать отдельные инстансы под разные клиенты (codex, zcode, ...)
   - пишет lease с heartbeat, чтобы reaper не убил живой сервер
   - дедлайн на каждый запрос (request_timeout); зависший Serena -> переподключение
-  - при обрыве MCP-сессии переподнимает сервер и реплеит initialize
+  - при обрыве MCP-сессии переподключается и повторяет initialize, не завершая живой сервер
 
 Режим --reaper: detached watchdog, гасит Serena-инстансы без свежих лизов по TTL.
 
-Все состояния: %USERPROFILE%\\.serena\\pool\\{registry,locks,leases,logs}, config.json.
+Все состояния: %USERPROFILE%\\.serena\\pool\\{registry,locks,leases,logs,contexts}, config.json.
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import ctypes
+from ctypes import wintypes
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
+import yaml
 
 POOL_DIR = Path.home() / ".serena" / "pool"
 REGISTRY_DIR = POOL_DIR / "registry"
@@ -40,6 +44,7 @@ LEASES_DIR = POOL_DIR / "leases"
 LOGS_DIR = POOL_DIR / "logs"
 CONFIG_PATH = POOL_DIR / "config.json"
 REAPER_PATH = POOL_DIR / "reaper.json"
+CONTEXTS_DIR = POOL_DIR / "contexts"
 
 DEFAULT_CONFIG = {
     "ttl_seconds": 1200,          # простой Serena без лизов до убийства
@@ -52,7 +57,7 @@ DEFAULT_CONFIG = {
     "request_timeout": 600,       # дедлайн одного запроса через мост, сек (0 = без дедлайна)
 }
 
-for d in (REGISTRY_DIR, LOCKS_DIR, LEASES_DIR, LOGS_DIR):
+for d in (REGISTRY_DIR, LOCKS_DIR, LEASES_DIR, LOGS_DIR, CONTEXTS_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 
@@ -90,6 +95,12 @@ def serena_exe(cfg: dict) -> str:
 
 _kernel32 = ctypes.windll.kernel32
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+_kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+_kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
 
 # Windows process creation flags
 DETACHED_PROCESS = 0x00000008
@@ -111,10 +122,13 @@ def hidden_startupinfo() -> subprocess.STARTUPINFO:
 
 def pid_alive(pid: int) -> bool:
     handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-    if handle:
+    if not handle:
+        return False
+    try:
+        exit_code = wintypes.DWORD()
+        return bool(_kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and exit_code.value == 259
+    finally:
         _kernel32.CloseHandle(handle)
-        return True
-    return False
 
 
 def kill_tree(pid: int) -> None:
@@ -156,6 +170,63 @@ def resolve_context(cfg: dict) -> str:
     return (os.environ.get("SERENA_POOL_CONTEXT") or "").strip() or cfg["context"]
 
 
+def resolve_project(project: str, current: Path) -> Path:
+    """Resolve paths and registered Serena project names without activating a shared server."""
+    candidate = Path(project).expanduser()
+    if not candidate.is_absolute():
+        candidate = current / candidate
+    if candidate.is_dir():
+        return candidate.resolve()
+    serena_home = Path(os.environ.get("SERENA_HOME") or Path.home() / ".serena")
+    config_path = serena_home / "serena_config.yml"
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) if config_path.exists() else {}
+    matches = []
+    for root in config.get("projects", []) or []:
+        root = Path(root)
+        project_yml = root / ".serena" / "project.yml"
+        if project_yml.is_file():
+            info = yaml.safe_load(project_yml.read_text(encoding="utf-8")) or {}
+            if info.get("project_name") == project:
+                matches.append(root.resolve())
+    if len(matches) == 1:
+        return matches[0]
+    raise ValueError(f"Project {project!r} is not an existing directory or a unique registered Serena project name")
+
+
+def pinned_context_path(cfg: dict, key: str) -> Path:
+    """Copy the configured native context and make the backend single-project."""
+    context = resolve_context(cfg)
+    serena_home = Path(os.environ.get("SERENA_HOME") or Path.home() / ".serena")
+    custom = Path(context).expanduser()
+    if not custom.is_file():
+        custom = serena_home / "contexts" / f"{context}.yml"
+    if custom.is_file():
+        data = yaml.safe_load(custom.read_text(encoding="utf-8"))
+        name = data.get("name", custom.stem)
+    else:
+        # Use Serena's public CLI to obtain the installed version's builtin context.
+        with tempfile.TemporaryDirectory(prefix="context-", dir=POOL_DIR) as temp:
+            # `context create` opens an editor. Windows' file lookup command accepts
+            # the generated path without opening a UI or changing file associations.
+            editor = str(Path(os.environ["SystemRoot"]) / "System32" / "where.exe")
+            result = subprocess.run(
+                [serena_exe(cfg), "context", "create", "--from-internal", context, "--name", "pool-base"],
+                env=dict(os.environ, SERENA_HOME=temp, PYTHONUTF8="1", EDITOR=editor),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding="utf-8",
+                timeout=cfg["start_timeout"], creationflags=CREATE_NO_WINDOW,
+            )
+            if result.returncode:
+                raise RuntimeError(f"Cannot load Serena context {context!r}: {result.stderr[-1500:]}")
+            data = yaml.safe_load((Path(temp) / "contexts" / "pool-base.yml").read_text(encoding="utf-8"))
+        name = data.get("name", context)
+    data["name"] = name
+    data["single_project"] = True
+    target = CONTEXTS_DIR / f"{key}.yml"
+    target.write_text(yaml.safe_dump(data, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    return target
+
+
 def req_timeout(cfg: dict) -> float | None:
     """Дедлайн одного запроса через мост, сек; 0 отключает дедлайн."""
     t = float(cfg.get("request_timeout", 600) or 600)
@@ -167,13 +238,13 @@ def norm_path(p) -> str:
 
 
 def port_candidates(project_path: Path, cfg: dict):
-    """Детерминированные (key, port) с линейным пробингом при коллизиях."""
+    """Isolated backends have a separate identity from legacy switchable servers."""
     norm = norm_path(project_path)
-    digest = hashlib.md5(f"{norm}::{resolve_context(cfg)}".encode("utf-8")).hexdigest()
-    base = cfg["port_base"] + int(digest, 16) % cfg["port_range"]
-    for i in range(50):
+    digest = hashlib.md5(f"{norm}::{resolve_context(cfg)}::single-project".encode("utf-8")).hexdigest()
+    offset = int(digest, 16) % cfg["port_range"]
+    for i in range(min(50, cfg["port_range"])):
         key = digest[:8] if i == 0 else f"{digest[:8]}-{i}"
-        yield key, base + i
+        yield key, cfg["port_base"] + (offset + i) % cfg["port_range"]
 
 
 def read_registry(key: str) -> dict | None:
@@ -226,13 +297,17 @@ def file_lock(key: str, timeout: float = 90.0):
 # --- server lifecycle --------------------------------------------------------
 
 def _spawn_serena(project_path: Path, key: str, port: int, cfg: dict) -> dict:
+    reserved = {"--project", "--project-file", "--project-from-cwd", "--context", "--transport", "--host", "--port"}
+    if any(arg.split("=", 1)[0] in reserved for arg in cfg.get("extra_args", [])):
+        raise ValueError("extra_args cannot override the pool's project, context, or HTTP binding")
+    context_path = pinned_context_path(cfg, key)
     cmd = [
         serena_exe(cfg), "start-mcp-server",
         "--transport", "streamable-http",
         "--host", "127.0.0.1",
         "--port", str(port),
         "--project", str(project_path),
-        "--context", resolve_context(cfg),
+        "--context", str(context_path),
         *cfg.get("extra_args", []),
     ]
     log_file = open(LOGS_DIR / f"serena-{key}.log", "ab", buffering=0)
@@ -248,6 +323,7 @@ def _spawn_serena(project_path: Path, key: str, port: int, cfg: dict) -> dict:
         "key": key,
         "project_path": str(project_path),
         "context": resolve_context(cfg),
+        "profile": "single-project",
         "port": port,
         "pid": proc.pid,
         "started_at": time.time(),
@@ -320,7 +396,7 @@ def write_lease(key: str, project_path: Path) -> Path:
     return p
 
 
-def start_heartbeat(path: Path) -> threading.Event:
+def start_heartbeat(path: Path, cfg: dict) -> threading.Event:
     stop = threading.Event()
 
     def beat():
@@ -329,6 +405,7 @@ def start_heartbeat(path: Path) -> threading.Event:
                 os.utime(path)
             except OSError:
                 return
+            ensure_reaper(cfg)
 
     threading.Thread(target=beat, daemon=True).start()
     return stop
@@ -355,28 +432,38 @@ def freshest_lease_age(key: str, now: float) -> float | None:
 # --- reaper ------------------------------------------------------------------
 
 def ensure_reaper(cfg: dict) -> None:
-    try:
-        if REAPER_PATH.exists():
-            info = json.loads(REAPER_PATH.read_text(encoding="utf-8"))
-            if pid_alive(info.get("pid", -1)):
-                return
-    except Exception:
-        pass
-    try:
-        log_file = open(LOGS_DIR / "reaper.log", "ab", buffering=0)
-        # use pythonw.exe for the reaper to avoid a console window
-        pythonw = Path(sys.executable).with_name("pythonw.exe")
-        exe = str(pythonw) if pythonw.exists() else sys.executable
-        proc = subprocess.Popen(
-            [exe, os.path.abspath(__file__), "--reaper"],
-            stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-            startupinfo=hidden_startupinfo(),
-            close_fds=True,
-        )
-        log(f"spawned reaper pid={proc.pid}")
-    except Exception as exc:
-        log(f"reaper spawn failed, continuing without it: {exc}")
+    with file_lock("reaper-start"):
+        try:
+            if REAPER_PATH.exists():
+                info = json.loads(REAPER_PATH.read_text(encoding="utf-8"))
+                if pid_alive(info.get("pid", -1)):
+                    return
+        except (OSError, ValueError, TypeError):
+            pass
+        try:
+            log_file = open(LOGS_DIR / "reaper.log", "ab", buffering=0)
+            pythonw = Path(sys.executable).with_name("pythonw.exe")
+            exe = str(pythonw) if pythonw.exists() else sys.executable
+            proc = subprocess.Popen(
+                [exe, os.path.abspath(__file__), "--reaper"],
+                stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                startupinfo=hidden_startupinfo(),
+                close_fds=True,
+            )
+            log(f"spawned reaper pid={proc.pid}")
+            deadline = time.monotonic() + 10
+            while proc.poll() is None and time.monotonic() < deadline:
+                try:
+                    info = json.loads(REAPER_PATH.read_text(encoding="utf-8"))
+                    if info.get("started_at", 0) >= time.time() - 10 and pid_alive(info.get("pid", -1)):
+                        return
+                except (OSError, ValueError):
+                    pass
+                time.sleep(0.05)
+            log("reaper did not publish a live process; a heartbeat will retry")
+        except OSError as exc:
+            log(f"reaper spawn failed, continuing without it: {exc}")
 
 
 def reaper_main() -> int:
@@ -418,13 +505,13 @@ def reaper_main() -> int:
 
 def _clean_orphan_leases(known_keys: set, now: float) -> None:
     for p in LEASES_DIR.glob("*.json"):
-        key = p.name.split("__", 1)[0]
-        if key in known_keys:
-            continue
         try:
-            if now - p.stat().st_mtime > 3600:
-                p.unlink()
-        except OSError:
+            lease = json.loads(p.read_text(encoding="utf-8"))
+            if not pid_alive(lease["proxy_pid"]):
+                p.unlink(missing_ok=True)
+            elif lease["key"] not in known_keys and now - p.stat().st_mtime > 3600:
+                p.unlink(missing_ok=True)
+        except (OSError, ValueError, KeyError):
             pass
 
 
@@ -536,30 +623,49 @@ class Bridge:
         self.writer = StdoutWriter()
         self.init_msg: dict | None = None
         self.initialized_msg: dict | None = None
+        self.lease: Path | None = None
+        self.stop_hb: threading.Event | None = None
+        self.session_aliases: dict[str, str] = {}
+        # A route change waits for this client's earlier calls, never another client's calls.
+        self.request_lock = asyncio.Lock()
 
-    async def connect(self, force_restart: bool = False) -> None:
-        self.entry = ensure_server(self.project_path, self.cfg, force_restart=force_restart)
-        url = f"http://127.0.0.1:{self.entry['port']}/mcp"
-        old = self.session
-        self.session = SerenaHttpSession(url)
-        if old:
-            await old.close()
-        if self.init_msg:  # реплей MCP-сессии после рестарта сервера
-            log("replaying initialize on fresh serena")
-            resp = await asyncio.wait_for(
-                self.session.post_request(self.init_msg, self._on_server_msg),
-                timeout=req_timeout(self.cfg))
-            if resp is None or "error" in resp:
-                raise RuntimeError(f"initialize replay failed: {resp}")
-            if self.initialized_msg:
-                await self.session.post_no_reply(self.initialized_msg)
+    async def connect(self, project_path: Path | None = None) -> None:
+        target = project_path or self.project_path
+        entry = ensure_server(target, self.cfg)
+        candidate = SerenaHttpSession(f"http://127.0.0.1:{entry['port']}/mcp")
+        try:
+            if self.init_msg:
+                resp = await asyncio.wait_for(
+                    candidate.post_request(self.init_msg, self._on_server_msg),
+                    timeout=req_timeout(self.cfg))
+                if resp is None or "error" in resp:
+                    raise RuntimeError(f"initialize replay failed: {resp}")
+                if self.initialized_msg:
+                    await candidate.post_no_reply(self.initialized_msg)
+        except Exception:
+            await candidate.close()
+            raise
+
+        old_session, old_entry = self.session, self.entry
+        old_lease, old_stop = self.lease, self.stop_hb
+        if old_entry is None or old_entry["key"] != entry["key"]:
+            lease = write_lease(entry["key"], target)
+            stop = start_heartbeat(lease, self.cfg)
+        else:
+            lease, stop = old_lease, old_stop
+        self.session, self.entry, self.project_path = candidate, entry, target
+        self.lease, self.stop_hb = lease, stop
+        if old_entry is None or (old_entry["key"], old_entry["pid"]) != (entry["key"], entry["pid"]):
+            self.session_aliases.clear()
+        if old_lease is not None and old_lease != lease:
+            old_stop.set()
+            old_lease.unlink(missing_ok=True)
+        if old_session:
+            await old_session.close()
 
     async def reconnect(self) -> None:
-        try:
-            await self.connect(force_restart=False)
-        except Exception as exc:
-            log(f"soft reconnect failed ({exc}), force restart")
-            await self.connect(force_restart=True)
+        # A single client's transport failure must not kill a shared, running server.
+        await self.connect()
 
     async def _on_server_msg(self, payload: dict) -> None:
         """Сообщения сервера, пришедшие в чужом SSE-потоке."""
@@ -573,39 +679,118 @@ class Bridge:
         elif "method" in payload:  # нотификация (progress, logging) — клиенту
             await self.writer.send(payload)
 
-    async def handle_request(self, msg: dict) -> None:
-        if msg.get("method") == "initialize":
-            self.init_msg = msg
+    def _remember_session(self, response: dict, aliases=()) -> str | None:
+        content = response.get("result", {}).get("content", [])
+        text = "\n".join(item.get("text", "") for item in content)
+        match = re.search(r"Your Serena session id is \x60([^\x60]+)\x60", text)
+        if not match:
+            if aliases:
+                raise RuntimeError("Serena did not return a session ID for a REPL client")
+            return None  # Serena's TOOLS interface does not issue REPL session IDs.
+        native_session = match.group(1)
+        for alias in (*aliases, native_session):
+            self.session_aliases[alias] = native_session
+        return native_session
+
+    async def _initial_instructions(self, request_id, aliases=()) -> dict:
+        response = await asyncio.wait_for(
+            self.session.post_request(
+                {"jsonrpc": "2.0", "id": request_id, "method": "tools/call",
+                 "params": {"name": "initial_instructions", "arguments": {}}},
+                self._on_server_msg),
+            timeout=req_timeout(self.cfg))
+        if response is None or "error" in response or response.get("result", {}).get("isError"):
+            raise RuntimeError(f"Cannot initialize the project's Serena session: {response}")
+        self._remember_session(response, aliases)
+        return response
+
+    async def _forward(self, msg: dict) -> dict | None:
         timeout = req_timeout(self.cfg)
-        try:
-            resp = await asyncio.wait_for(
-                self.session.post_request(msg, self._on_server_msg), timeout=timeout)
-        except (httpx.TransportError, RuntimeError, asyncio.TimeoutError) as exc:
-            log(f"request {msg.get('method')} failed ({exc!r}), reconnecting")
+        for attempt in range(2):
             try:
+                forwarded = msg
+                params = msg.get("params") or {}
+                arguments = params.get("arguments") or {}
+                if msg.get("method") == "tools/call" and "session" in arguments:
+                    alias = arguments["session"]
+                    if alias not in self.session_aliases:
+                        await self._initial_instructions(f"pool-session-{msg.get('id')}", (alias,))
+                    forwarded = {**msg, "params": {**params, "arguments": {
+                        **arguments, "session": self.session_aliases[alias]}}}
+                return await asyncio.wait_for(
+                    self.session.post_request(forwarded, self._on_server_msg), timeout=timeout)
+            except (httpx.TransportError, RuntimeError, asyncio.TimeoutError) as exc:
+                if attempt:
+                    raise
+                log(f"request {msg.get('method')} failed ({exc!r}), reconnecting")
                 await self.reconnect()
-                resp = await asyncio.wait_for(
-                    self.session.post_request(msg, self._on_server_msg), timeout=timeout)
-            except Exception as exc2:
-                resp = {"jsonrpc": "2.0", "id": msg.get("id"),
-                        "error": {"code": -32000,
-                                  "message": f"serena pool proxy: {exc2}"}}
-        except Exception as exc:
-            resp = {"jsonrpc": "2.0", "id": msg.get("id"),
-                    "error": {"code": -32000, "message": f"serena pool proxy: {exc}"}}
-        if resp is not None:
-            await self.writer.send(resp)
+
+    async def handle_request(self, msg: dict) -> None:
+        async with self.request_lock:
+            method = msg.get("method")
+            if method == "initialize":
+                self.init_msg = msg
+            try:
+                params = msg.get("params") or {}
+                tool = params.get("name") if method == "tools/call" else None
+                arguments = params.get("arguments") or {}
+                if tool == "activate_project":
+                    try:
+                        target = resolve_project(arguments["project"], self.project_path)
+                        if norm_path(target) == norm_path(self.project_path):
+                            message = f"Project {self.project_path} is already active on its dedicated pooled HTTP server."
+                            resp = {"jsonrpc": "2.0", "id": msg.get("id"),
+                                    "result": {"content": [{"type": "text", "text": message}],
+                                               "structuredContent": {"result": message}, "isError": False}}
+                        else:
+                            aliases = set(self.session_aliases)
+                            if arguments.get("session"):
+                                aliases.add(arguments["session"])
+                            await self.connect(target)
+                            resp = await self._initial_instructions(msg.get("id"), aliases)
+                            log(f"routed client to project={target} port={self.entry['port']}")
+                    except (ValueError, KeyError) as exc:
+                        resp = {"jsonrpc": "2.0", "id": msg.get("id"),
+                                "result": {"content": [{"type": "text", "text": str(exc)}], "isError": True}}
+                else:
+                    resp = await self._forward(msg)
+                    if tool == "initial_instructions" and resp and not resp.get("result", {}).get("isError"):
+                        self._remember_session(resp)
+                    if method == "tools/list" and resp and "result" in resp:
+                        tool_list = resp["result"].get("tools", [])
+                        if not any(item["name"] == "activate_project" for item in tool_list):
+                            tool_list.append({
+                                "name": "activate_project",
+                                "description": "Connect this client to the named project's dedicated pooled HTTP server. Other clients and projects are unchanged.",
+                                "inputSchema": {
+                                    "type": "object",
+                                    "properties": {
+                                        "project": {"type": "string", "description": "Registered project name or project directory path."},
+                                        "session": {"type": "string", "description": "Your Serena session ID from initial_instructions."},
+                                    },
+                                    "required": ["project"],
+                                },
+                                "annotations": {"readOnlyHint": True, "destructiveHint": False},
+                            })
+                if resp is not None:
+                    await self.writer.send(resp)
+            except Exception as exc:
+                await self.writer.send({
+                    "jsonrpc": "2.0", "id": msg.get("id"),
+                    "error": {"code": -32000, "message": f"serena pool proxy: {exc}"}})
 
     async def handle_notification(self, msg: dict) -> None:
         if msg.get("method") == "notifications/initialized":
-            self.initialized_msg = msg
-        await self.session.post_no_reply(msg)
+            async with self.request_lock:
+                self.initialized_msg = msg
+                await self.session.post_no_reply(msg)
+        else:
+            # Cancellation must reach an in-flight request without waiting for it.
+            await self.session.post_no_reply(msg)
 
     async def run(self) -> None:
         await self.connect()
         ensure_reaper(self.cfg)
-        lease = write_lease(self.entry["key"], self.project_path)
-        stop_hb = start_heartbeat(lease)
         queue: asyncio.Queue = asyncio.Queue()
         stdin_task = asyncio.create_task(pump_stdin(queue))
         pending: set[asyncio.Task] = set()
@@ -638,11 +823,10 @@ class Bridge:
             stdin_task.cancel()
             for t in pending:
                 t.cancel()
-            stop_hb.set()
-            try:
-                lease.unlink()
-            except OSError:
-                pass
+            if self.stop_hb:
+                self.stop_hb.set()
+            if self.lease:
+                self.lease.unlink(missing_ok=True)
             if self.session:
                 await self.session.close()
 

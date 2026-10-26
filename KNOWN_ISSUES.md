@@ -1,21 +1,21 @@
 # Known issues
 
-Small rough edges found during review (2026-10-25). Neither is blocking; both are
-rare and self-healing. Recorded here so they are not rediscovered from scratch.
+Small rough edges found during review (2026-10-25), with resolution status below.
+Recorded here so they are not rediscovered from scratch.
 
-## 1. Port probing can step outside the declared port window
+## 1. Port probing can step outside the declared port window (fixed)
 
-`port_candidates()` computes `base = port_base + int(md5, 16) % port_range`
-(max. `port_base + port_range - 1`, i.e. 24699 with defaults) and then probes
+Previously, `port_candidates()` computed `base = port_base + int(md5, 16) % port_range`
+(max. `port_base + port_range - 1`, i.e. 24699 with defaults) and then probed
 `base + i` for `i` in `0..49`. In a collision chain the actual port can reach
 `port_base + port_range + 48` (24748 with defaults), i.e. outside the nominal
 `[24500, 24700)` window documented in the README.
 
 - **Impact:** cosmetic / documentation mismatch. Needs ~17+ project+context pairs
   (birthday bound on 200 ports) before collisions even start.
-- **Possible fix:** wrap the probe back into the window —
-  `port_base + ((base - port_base + i) % port_range)` — or document the window
-  as nominal.
+- **Resolution:** probes now wrap into the configured window and stop before
+  repeating candidates when `port_range` is smaller than 50. Covered by
+  `tests/test_pool.py`.
 
 ## 2. A freed lower port can shadow an existing warm instance (collision case)
 
