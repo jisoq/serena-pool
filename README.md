@@ -73,24 +73,28 @@ or clone and install into an independent uv tool environment:
 Run `serena-pool-tray` from the same installation as `serena-pool`. The observer starts
 explicitly and allows one instance per pool. Hover over its icon
 for observed HTTP server and connected proxy counts. Left-click to open the native status
-window. Compare project, location, context, status, port, and connected proxies in one table.
-Select a server to copy its full path and proxy PIDs, inspect its server PID and profile,
-or open its log. Right-click for **Show status**, **Open logs folder**, and **Exit tray**.
+window. Its Korean interface shows running server and connected proxy counts above a
+comparison table. Select a server to copy its full path, server PID, profile, and proxy
+PIDs from the right inspector. In a narrow window, the inspector moves below the table.
+Project names, paths, context strings, and profile identifiers retain their original text.
+Use **서버 로그 열기** for the selected server. Right-click for **상태 보기**,
+**로그 폴더 열기**, and **트레이 종료**.
 Close the window or press Escape to hide it. Launch the observer again to reopen its window.
-**Open logs folder** opens the existing pool logs. **Exit tray** leaves the pool running.
+**로그 폴더 열기** opens the existing pool logs. **트레이 종료** leaves the pool running.
 
 The observer reads the existing registry and leases immediately, then waits five seconds
 between observations. An HTTP server counts when its PID is available and a bounded TCP
-connection succeeds. **PID unavailable** also covers processes Windows will not let the
-observer inspect. **Port unavailable** reports the connection check, not application health.
+connection succeeds. **PID 확인 불가** also covers processes Windows will not let the
+observer inspect. **포트 확인 불가** reports the connection check, not application health.
 A proxy counts when its PID is available and its heartbeat is at most 90 seconds old.
 Each proxy PID counts once, under its newest lease. Unassociated leases appear under
-**Pending connections** in the diagnostic area below the selected server. These observations
+**연결 대기** in the diagnostic footer. Use **진단 보기** to read pending paths, PIDs,
+and source read errors. **진단 접기** closes these details. These observations
 do not measure named agents, busy work, or MCP session health.
 
 A gray icon indicates an empty pool or the initial observation. Green indicates activity.
 Amber indicates unavailable records, stale proxies, a missing reaper for an active pool,
-or a read issue. Malformed or inaccessible files produce **Incomplete observation** counts;
+or a read issue. Malformed or inaccessible files show **일부 상태 확인 불가**;
 valid records remain visible. The window includes the observation age, reaper state, and read
 issues. Rows and details use the same observation. Refresh preserves the selected server
 while it remains in the pool.
@@ -153,6 +157,10 @@ Global config: `~/.serena/pool/config.json` (created with defaults on first run)
 | `extra_args` | `[]` | extra args for `serena start-mcp-server` |
 | `start_timeout` | `90` | seconds to wait for the server port to open |
 | `request_timeout` | `600` | per-request deadline through the bridge, seconds (`0` disables) |
+
+There is no explicit server-count or proxy-count setting. The default port window has
+200 ports. Each server allocation examines at most 50 candidate ports, or `port_range`
+when smaller. This allocation probe limit does not limit the number of proxies.
 
 `extra_args` cannot override the project, context, transport, host, or port: the pool
 owns these arguments to maintain project isolation and registry consistency.

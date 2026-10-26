@@ -58,6 +58,24 @@ class NMHDR(ctypes.Structure):
     _fields_ = [("hwndFrom", w.HWND), ("idFrom", ctypes.c_size_t), ("code", w.UINT)]
 
 
+class NMCUSTOMDRAW(ctypes.Structure):
+    _fields_ = [("hdr", NMHDR), ("dwDrawStage", w.DWORD), ("hdc", w.HDC),
+                ("rc", w.RECT), ("dwItemSpec", ctypes.c_size_t), ("uItemState", w.UINT),
+                ("lItemlParam", w.LPARAM)]
+
+
+class NMLVCUSTOMDRAW(ctypes.Structure):
+    _fields_ = [("nmcd", NMCUSTOMDRAW), ("clrText", w.DWORD), ("clrTextBk", w.DWORD),
+                ("iSubItem", ctypes.c_int), ("dwItemType", w.DWORD), ("clrFace", w.DWORD),
+                ("iIconEffect", ctypes.c_int), ("iIconPhase", ctypes.c_int),
+                ("iPartId", ctypes.c_int), ("iStateId", ctypes.c_int), ("rcText", w.RECT),
+                ("uAlign", w.UINT)]
+
+
+class HIGHCONTRAST(ctypes.Structure):
+    _fields_ = [("cbSize", w.UINT), ("dwFlags", w.DWORD), ("lpszDefaultScheme", w.LPWSTR)]
+
+
 class MINMAXINFO(ctypes.Structure):
     _fields_ = [("ptReserved", w.POINT), ("ptMaxSize", w.POINT), ("ptMaxPosition", w.POINT),
                 ("ptMinTrackSize", w.POINT), ("ptMaxTrackSize", w.POINT)]
@@ -103,6 +121,8 @@ for dll, name, result, arguments in (
     (user32, "GetDpiForSystem", w.UINT, []),
     (user32, "GetSysColor", w.DWORD, [ctypes.c_int]),
     (user32, "GetSysColorBrush", w.HBRUSH, [ctypes.c_int]),
+    (user32, "SystemParametersInfoW", w.BOOL, [w.UINT, w.UINT, ctypes.c_void_p, w.UINT]),
+    (user32, "FillRect", ctypes.c_int, [w.HDC, ctypes.POINTER(w.RECT), w.HBRUSH]),
     (user32, "SetThreadDpiAwarenessContext", w.HANDLE, [w.HANDLE]),
     (user32, "LoadCursorW", w.HANDLE, [w.HINSTANCE, ctypes.c_void_p]),
     (user32, "SendMessageW", LRESULT, [w.HWND, w.UINT, w.WPARAM, w.LPARAM]),
@@ -139,6 +159,10 @@ for dll, name, result, arguments in (
         w.DWORD, w.DWORD, w.LPCWSTR]),
     (gdi32, "DeleteObject", w.BOOL, [w.HANDLE]),
     (gdi32, "SetBkColor", w.DWORD, [w.HDC, w.DWORD]),
+    (gdi32, "SetTextColor", w.DWORD, [w.HDC, w.DWORD]),
+    (gdi32, "GetStockObject", w.HANDLE, [ctypes.c_int]),
+    (gdi32, "SetDCBrushColor", w.DWORD, [w.HDC, w.DWORD]),
+    (gdi32, "SelectObject", w.HANDLE, [w.HDC, w.HANDLE]),
     (uxtheme, "SetWindowTheme", LRESULT, [w.HWND, w.LPCWSTR, w.LPCWSTR]),
 ):
     function = getattr(dll, name)
@@ -150,6 +174,7 @@ WM_SNAPSHOT = 0x8002
 WM_CLOSE = 0x0010
 WM_SHOW_STATUS = 0x8003
 WM_SIZE = 0x0005
+WM_ERASEBKGND = 0x0014
 WM_SETREDRAW = 0x000B
 WM_GETMINMAXINFO = 0x0024
 WM_SETFONT = 0x0030
@@ -162,6 +187,7 @@ EXIT = 1
 OPEN_LOGS = 2
 SHOW_STATUS = 3
 OPEN_SERVER_LOG = 4
+TOGGLE_DIAGNOSTICS = 5
 LVM_FIRST = 0x1000
 LVM_SETIMAGELIST = LVM_FIRST + 3
 LVM_DELETEALLITEMS = LVM_FIRST + 9
@@ -201,11 +227,11 @@ def acquire_singleton():
 
 def summary(snapshot: pool.PoolSnapshot | None) -> str:
     if snapshot is None:
-        return "Checking pool"
-    state = {"neutral": "Idle", "active": "Active", "attention": "Attention"}[icon_state(snapshot)]
+        return "상태 확인 중"
+    state = {"neutral": "대기 중", "active": "사용 중", "attention": "확인 필요"}[icon_state(snapshot)]
     if snapshot.issues:
-        state += " | Incomplete observation"
-    return f"{state} | {snapshot.server_count} HTTP servers | {snapshot.proxy_count} connected proxies"
+        state += " | 일부 상태 확인 불가"
+    return f"{state} | 실행 중 서버 {snapshot.server_count}개 | 연결 프록시 {snapshot.proxy_count}개"
 
 
 def icon_state(snapshot: pool.PoolSnapshot | None) -> str:
@@ -228,8 +254,8 @@ class Tray:
         self.hwnd = None
         self.status_hwnd = None
         self.status_controls = {}
-        self.status_font = None
-        self.status_heading_font = None
+        self.status_fonts = {}
+        self.diagnostics_expanded = False
         self.row_images = None
         self.status_dpi = 0
         self._refreshing_status = False
@@ -248,8 +274,8 @@ class Tray:
         if not menu:
             raise ctypes.WinError(ctypes.get_last_error())
         try:
-            for label, command in (("Show status", SHOW_STATUS), ("Open logs folder", OPEN_LOGS),
-                                   ("Exit tray", EXIT)):
+            for label, command in (("상태 보기", SHOW_STATUS), ("로그 폴더 열기", OPEN_LOGS),
+                                   ("트레이 종료", EXIT)):
                 if not user32.AppendMenuW(menu, 0, command, label):
                     raise ctypes.WinError(ctypes.get_last_error())
             return menu
@@ -260,11 +286,12 @@ class Tray:
     def open_path(self, path: Path):
         try:
             if not path.exists():
-                raise FileNotFoundError(f"Log path does not exist: {path}")
+                raise FileNotFoundError(f"로그 경로가 없습니다.\n{path}")
             os.startfile(str(path))
         except OSError as exc:
-            logging.exception("Cannot open %s", path)
-            user32.MessageBoxW(self.status_hwnd or self.hwnd, str(exc), "Serena pool", 0x10)
+            logging.exception("경로를 열 수 없습니다: %s", path)
+            user32.MessageBoxW(self.status_hwnd or self.hwnd,
+                f"로그를 열 수 없습니다.\n{path}\n\n{exc}", "로그 열기 실패", 0x10)
 
     def show_menu(self):
         menu = self.build_menu()
@@ -290,15 +317,15 @@ class Tray:
         if not comctl32.InitCommonControlsEx(ctypes.byref(common)):
             raise ctypes.WinError(ctypes.get_last_error())
         window_class = WNDCLASS(lpfnWndProc=self.status_callback, hInstance=instance,
-            hIcon=self.icons.get("active"), hCursor=user32.LoadCursorW(None, 32512),
-            hbrBackground=6, lpszClassName=self._status_class)
+            hIcon=self.icons.get(icon_state(self.snapshot)), hCursor=user32.LoadCursorW(None, 32512),
+            hbrBackground=None, lpszClassName=self._status_class)
         if not user32.RegisterClassW(ctypes.byref(window_class)):
             raise ctypes.WinError(ctypes.get_last_error())
         try:
             scale = user32.GetDpiForSystem() / 96
             self.status_hwnd = user32.CreateWindowExW(0x10000, self._status_class,
-                "Serena Pool status", 0x00CF0000, -2147483648, -2147483648,
-                round(980 * scale), round(620 * scale), None, None, instance, None)
+                "Serena Pool 상태", 0x02CF0000, -2147483648, -2147483648,
+                round(1140 * scale), round(720 * scale), None, None, instance, None)
             if not self.status_hwnd:
                 raise ctypes.WinError(ctypes.get_last_error())
 
@@ -310,27 +337,43 @@ class Tray:
                 self.status_controls[key] = handle
                 return handle
 
-            control("summary", "STATIC", "Checking pool")
-            control("logs", "BUTTON", "Open logs folder", 0x50010000, OPEN_LOGS)
-            servers = control("servers", "SysListView32", style=0x5001000D, edge=0x200)
+            control("title", "STATIC", "Serena Pool")
+            control("summary", "STATIC", "상태 확인 중")
+            control("server_count", "STATIC", "확인 중")
+            control("server_count_label", "STATIC", "실행 중 서버")
+            control("proxy_count", "STATIC", "확인 중")
+            control("proxy_count_label", "STATIC", "연결 프록시")
+            servers = control("servers", "SysListView32", "서버 목록", style=0x5001000D, edge=0x200)
+            user32.SendMessageW(servers, 0x2007, 5, 0)
             user32.SendMessageW(servers, LVM_SETEXTENDEDLISTVIEWSTYLE, 0, 0x10020)
             uxtheme.SetWindowTheme(servers, "Explorer", None)
-            for column, label in enumerate(("Project", "Location", "Context", "Status",
-                                             "Port", "Connected proxies")):
+            for column, label in enumerate(("프로젝트", "위치", "컨텍스트", "상태",
+                                             "포트", "연결 프록시")):
                 text = ctypes.create_unicode_buffer(label)
                 native_column = LVCOLUMN(mask=7, fmt=1 if column >= 4 else 0, cx=100,
                                          pszText=ctypes.cast(text, w.LPWSTR))
                 if user32.SendMessageW(servers, LVM_INSERTCOLUMNW, column,
                                        ctypes.addressof(native_column)) == -1:
-                    raise OSError("Windows could not create the server columns")
-            control("selected", "STATIC", "Select a server")
-            control("server_log", "BUTTON", "Open server log", 0x50010000, OPEN_SERVER_LOG)
-            control("path_label", "STATIC", "Project path")
-            control("path", "EDIT", style=0x50010880)
-            control("server", "STATIC")
-            control("proxies_label", "STATIC", "Proxy PIDs")
-            control("proxies", "EDIT", style=0x50010844)
-            control("diagnostics", "EDIT", style=0x50210844)
+                    raise OSError("서버 목록의 열을 만들 수 없습니다.")
+            control("empty", "STATIC", "상태 확인 중", style=0x50000081)
+            control("inspector", "STATIC", style=0x50000000)
+            control("selected", "STATIC", "서버 선택")
+            control("context", "STATIC")
+            control("path_label", "STATIC", "프로젝트 경로")
+            control("path", "EDIT", style=0x50210844, edge=0x200)
+            control("proxies_label", "STATIC", "프록시 PID")
+            control("proxies", "EDIT", style=0x50210844, edge=0x200)
+            control("server_label", "STATIC", "서버 PID")
+            control("server", "EDIT", style=0x50010880)
+            control("profile_label", "STATIC", "프로필")
+            control("profile", "EDIT", style=0x50010880)
+            control("server_log", "BUTTON", "서버 로그 열기", 0x50010000, OPEN_SERVER_LOG)
+            control("logs", "BUTTON", "로그 폴더 열기", 0x50010000, OPEN_LOGS)
+            control("observed", "STATIC", "첫 상태를 확인하는 중입니다.")
+            control("reaper", "STATIC")
+            control("issues", "STATIC")
+            control("diagnostic_toggle", "BUTTON", "진단 보기", 0x50010000, TOGGLE_DIAGNOSTICS)
+            control("diagnostics", "EDIT", style=0x50210844, edge=0x200)
             self._layout_status()
             self.refresh_status(self.snapshot)
         except Exception:
@@ -343,56 +386,130 @@ class Tray:
         dpi = user32.GetDpiForWindow(self.status_hwnd)
         scale = dpi / 96
         if dpi != self.status_dpi:
-            font = gdi32.CreateFontW(-round(10 * dpi / 72), 0, 0, 0, 400, 0, 0, 0,
-                                     1, 0, 0, 5, 0, "Segoe UI")
-            heading = gdi32.CreateFontW(-round(10 * dpi / 72), 0, 0, 0, 600, 0, 0, 0,
-                                        1, 0, 0, 5, 0, "Segoe UI")
-            if not font or not heading:
-                if font:
+            fonts = {}
+            try:
+                for role, size, weight, face in (
+                    ("body", 10, 400, "Malgun Gothic"),
+                    ("label", 9, 400, "Malgun Gothic"),
+                    ("emphasis", 10, 600, "Malgun Gothic"),
+                    ("title", 18, 600, "Malgun Gothic"),
+                    ("number", 22, 600, "Malgun Gothic"),
+                    ("identity", 14, 600, "Malgun Gothic"),
+                    ("technical", 10, 400, "Consolas"),
+                ):
+                    font = gdi32.CreateFontW(-round(size * dpi / 72), 0, 0, 0, weight,
+                        0, 0, 0, 1, 0, 0, 5, 0, face)
+                    if not font:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    fonts[role] = font
+                images = comctl32.ImageList_Create(1, round(32 * scale), 0x20, 1, 0)
+                if not images:
+                    raise ctypes.WinError(ctypes.get_last_error())
+            except Exception:
+                for font in fonts.values():
                     gdi32.DeleteObject(font)
-                if heading:
-                    gdi32.DeleteObject(heading)
-                raise ctypes.WinError(ctypes.get_last_error())
+                raise
             for key, handle in self.status_controls.items():
-                user32.SendMessageW(handle, WM_SETFONT,
-                    heading if key in ("summary", "selected") else font, True)
-            for old_font in (self.status_font, self.status_heading_font):
-                if old_font:
-                    gdi32.DeleteObject(old_font)
-            self.status_font, self.status_heading_font = font, heading
-            images = comctl32.ImageList_Create(1, round(26 * scale), 0x20, 1, 0)
-            if not images:
-                raise ctypes.WinError(ctypes.get_last_error())
+                role = ("title" if key == "title" else "number" if key.endswith("_count")
+                    else "identity" if key == "selected"
+                    else "technical" if key in ("server", "proxies")
+                    else "label" if key.endswith("_label") or key in ("observed", "reaper", "issues")
+                    else "body")
+                user32.SendMessageW(handle, WM_SETFONT, fonts[role], True)
             user32.SendMessageW(self.status_controls["servers"], LVM_SETIMAGELIST, 1, images)
+            for font in self.status_fonts.values():
+                gdi32.DeleteObject(font)
             if self.row_images:
                 comctl32.ImageList_Destroy(self.row_images)
+            self.status_fonts = fonts
             self.row_images = images
             self.status_dpi = dpi
         rect = w.RECT()
         user32.GetClientRect(self.status_hwnd, ctypes.byref(rect))
         width, height = rect.right / scale, rect.bottom / scale
-        grid_height = max(100, height - 266)
-        detail_y = 60 + grid_height + 12
+        short = height < 560
+        header = 80 if short else 108
+        footer_y = height - 36
+        diagnostic_height = 42 if short else 80
+        body_bottom = footer_y - 8 - (diagnostic_height + 8 if self.diagnostics_expanded else 0)
+        compact = width < 1040 or body_bottom - header < 388
+        margin = 16 if compact else 20
+        table_width = width - 2 * margin - (316 if not compact else 0)
+        if compact:
+            inspector_height = 150 if short else 190
+            table_height = body_bottom - header - 10 - inspector_height
+            panel_x, panel_y = margin, header + table_height + 10
+            panel_width = width - 2 * margin
+        else:
+            table_height = body_bottom - header
+            panel_x, panel_y = width - margin - 300, header
+            panel_width, inspector_height = 300, table_height
+        x, y, inner = panel_x + 12, panel_y + 8, panel_width - 24
         positions = {
-            "summary": (18, 18, width - 190, 24),
-            "logs": (width - 160, 12, 142, 30),
-            "servers": (18, 60, width - 36, grid_height),
-            "selected": (18, detail_y + 3, width - 196, 24),
-            "server_log": (width - 160, detail_y, 142, 29),
-            "path_label": (18, detail_y + 39, 84, 23),
-            "path": (106, detail_y + 34, width - 124, 27),
-            "server": (106, detail_y + 69, width - 124, 22),
-            "proxies_label": (18, detail_y + 98, 84, 22),
-            "proxies": (106, detail_y + 94, width - 124, 40),
-            "diagnostics": (18, height - 44, width - 36, 36),
+            "title": (margin, 8 if short else 16, 182, 34),
+            "summary": (margin + 190, 18 if short else 26, width - margin - 370, 24),
+            "server_count": (margin, 40 if short else 56, 96, 40),
+            "server_count_label": (margin + 100, 53 if short else 70, 120, 22),
+            "proxy_count": (margin + 236, 40 if short else 56, 96, 40),
+            "proxy_count_label": (margin + 336, 53 if short else 70, 120, 22),
+            "logs": (width - margin - 142, 14 if short else 22, 142, 30),
+            "servers": (margin, header, table_width, table_height),
+            "empty": (margin + 12, header + 48, table_width - 24, 28),
+            "inspector": (panel_x, panel_y, panel_width, inspector_height),
+            "observed": (margin, footer_y + 5, 126, 24),
+            "reaper": (margin + 136, footer_y + 5, 254, 24),
+            "issues": (width - margin - 346, footer_y + 5, 238, 24),
+            "diagnostic_toggle": (width - margin - 100, footer_y, 100, 28),
+            "diagnostics": (margin, footer_y - diagnostic_height - 8,
+                            width - 2 * margin, diagnostic_height),
         }
-        for key, (x, y, cw, ch) in positions.items():
-            user32.MoveWindow(self.status_controls[key], round(x * scale), round(y * scale),
+        if compact:
+            left = round((inner - 16) * 0.59)
+            right_x, right = x + left + 16, inner - left - 16
+            field_height = 60 if short else 100
+            positions.update({
+                "selected": (x, y, inner - 290, 28),
+                "context": (x + inner - 280, y + 5, 124, 22),
+                "server_log": (x + inner - 142, y, 142, 28),
+                "path_label": (x, y + 32, left, 20),
+                "path": (x, y + 52, left, field_height),
+                "proxies_label": (right_x, y + 32, right, 20),
+                "proxies": (right_x, y + 52, right, field_height + 20),
+                "server_label": (x, y + field_height + 58, 64, 22),
+                "server": (x + 66, y + field_height + 57, 68, 23),
+                "profile_label": (x + 140, y + field_height + 58, 44, 22),
+                "profile": (x + 188, y + field_height + 57, left - 188, 23),
+            })
+        else:
+            path_height = min(120, max(70, inspector_height - 330))
+            metadata_y = y + 114 + path_height
+            profile = bool(self.displayed_snapshot and any(
+                server.key == self.selected_server_key and server.profile
+                for server in self.displayed_snapshot.servers))
+            proxy_y = metadata_y + (78 if profile else 48)
+            positions.update({
+                "selected": (x, y + 4, inner, 30),
+                "context": (x, y + 38, inner, 22),
+                "server_log": (x, y + 66, inner, 30),
+                "path_label": (x, y + 108, inner, 20),
+                "path": (x, y + 130, inner, path_height),
+                "server_label": (x, metadata_y + 24, 70, 22),
+                "server": (x + 78, metadata_y + 23, inner - 78, 24),
+                "profile_label": (x, metadata_y + 54, 70, 22),
+                "profile": (x + 78, metadata_y + 53, inner - 78, 24),
+                "proxies_label": (x, proxy_y + 24, inner, 20),
+                "proxies": (x, proxy_y + 46, inner,
+                            panel_y + inspector_height - 12 - proxy_y - 46),
+            })
+        for key, (cx, cy, cw, ch) in positions.items():
+            user32.MoveWindow(self.status_controls[key], round(cx * scale), round(cy * scale),
                                round(cw * scale), round(ch * scale), True)
-        available = width - 36 - 20
-        for column, column_width in enumerate((150, max(100, available - 570), 100, 120, 65, 135)):
+        available = table_width - 22
+        for column, column_width in enumerate((126, available - 472, 86, 110, 60, 90)):
             user32.SendMessageW(self.status_controls["servers"], LVM_SETCOLUMNWIDTH,
                                 column, round(column_width * scale))
+        user32.ShowWindow(self.status_controls["diagnostics"], 5 if self.diagnostics_expanded else 0)
+        user32.InvalidateRect(self.status_hwnd, None, True)
 
     def show_status(self):
         if not self.status_hwnd:
@@ -448,8 +565,8 @@ class Tray:
                 count = sum(proxy.state == "connected" and proxy.server_key == server.key
                             and proxy.project_path == server.project_path for proxy in snapshot.proxies)
                 values = (Path(server.project_path).name, locations[server.project_path],
-                          server.context, {"running": "Running", "pid_unavailable": "PID unavailable",
-                                           "port_unavailable": "Port unavailable"}[server.state],
+                          server.context, {"running": "실행 중", "pid_unavailable": "PID 확인 불가",
+                                           "port_unavailable": "포트 확인 불가"}[server.state],
                           str(server.port), str(count))
                 for column, value in enumerate(values):
                     text = ctypes.create_unicode_buffer(value)
@@ -459,7 +576,7 @@ class Tray:
                         message = LVM_INSERTITEMW if keys != old_keys else LVM_SETITEMW
                         result = user32.SendMessageW(servers, message, 0, ctypes.addressof(item))
                         if result == (-1 if message == LVM_INSERTITEMW else 0):
-                            raise OSError("Windows could not render a server row")
+                            raise OSError("서버 목록의 행을 표시할 수 없습니다.")
                     else:
                         user32.SendMessageW(servers, LVM_SETITEMTEXTW, row, ctypes.addressof(item))
             if previous is None and keys and self.selected_server_key is None:
@@ -477,46 +594,121 @@ class Tray:
             user32.SendMessageW(servers, WM_SETREDRAW, True, 0)
             user32.InvalidateRect(servers, None, False)
             self._refreshing_status = False
-        self._set_status_text("summary", summary(snapshot))
-        diagnostics = ["Waiting for the first observation."]
+        self._set_status_text("summary", ({"neutral": "대기 중", "active": "사용 중",
+            "attention": "확인 필요"}[icon_state(snapshot)] +
+            (" | 일부 상태 확인 불가" if snapshot.issues else "")) if snapshot else "상태 확인 중")
+        self._set_status_text("server_count", str(snapshot.server_count) if snapshot else "확인 중")
+        self._set_status_text("proxy_count", str(snapshot.proxy_count) if snapshot else "확인 중")
+        self._set_status_text("empty", ("일부 상태 확인 불가" if snapshot.issues
+            else "등록된 서버가 없습니다.") if snapshot else "상태 확인 중")
+        user32.ShowWindow(self.status_controls["empty"], 0 if keys else 5)
+        icon = self.icons.get(icon_state(snapshot))
+        user32.SendMessageW(self.status_hwnd, 0x0080, 0, icon or 0)
+        user32.SendMessageW(self.status_hwnd, 0x0080, 1, icon or 0)
+        diagnostics = []
+        notices = []
         if snapshot:
             age = max(0, int(time.time() - snapshot.observed_at))
-            diagnostics = [f"Observed {age}s ago | Reaper {snapshot.reaper.replace('_', ' ')}"]
+            self._set_status_text("observed", f"{age}초 전 확인")
+            self._set_status_text("reaper", {"running": "정리 프로세스 실행 중",
+                "missing": "정리 프로세스 기록 없음", "pid_unavailable": "정리 프로세스 PID 확인 불가",
+                "unreadable": "정리 프로세스 읽기 실패"}[snapshot.reaper])
             associated = {(server.key, server.project_path) for server in snapshot.servers}
             pending = [proxy for proxy in snapshot.proxies
                        if (proxy.server_key, proxy.project_path) not in associated]
             if pending:
-                diagnostics[0] += f" | {len(pending)} pending connections"
-                diagnostics.append("Pending connections")
-                diagnostics.extend(f"PID {proxy.pid} ({proxy.state}) | {proxy.project_path}"
+                notices.append(f"연결 대기 {len(pending)}건")
+                diagnostics.append(notices[-1])
+                states = {"connected": "연결됨", "stale": "갱신 지연"}
+                diagnostics.extend(f"PID {proxy.pid} ({states[proxy.state]}) | {proxy.project_path}"
                                    for proxy in pending)
             if snapshot.issues:
-                diagnostics[0] += f" | {len(snapshot.issues)} read issues"
-            diagnostics.extend("Read issue: " + issue for issue in snapshot.issues)
+                notices.append(f"읽기 오류 {len(snapshot.issues)}건")
+                diagnostics.extend("읽기 오류: " + issue for issue in snapshot.issues)
+        else:
+            self._set_status_text("observed", "첫 상태를 확인하는 중입니다.")
+            self._set_status_text("reaper", "")
+        self._set_status_text("issues", " | ".join(notices))
         self._set_status_text("diagnostics", "\r\n".join(diagnostics))
+        if not diagnostics:
+            self.diagnostics_expanded = False
+        self._set_status_text("diagnostic_toggle", "진단 접기" if self.diagnostics_expanded else "진단 보기")
+        user32.ShowWindow(self.status_controls["diagnostic_toggle"], 5 if diagnostics else 0)
         self._refresh_selection()
+        self._layout_status()
 
     def _refresh_selection(self):
         snapshot = self.displayed_snapshot
         server = next((server for server in snapshot.servers
                        if server.key == self.selected_server_key), None) if snapshot else None
-        self._set_status_text("selected",
-            f"{Path(server.project_path).name} / {server.context}" if server else "Select a server")
+        self._set_status_text("selected", Path(server.project_path).name if server else "서버 선택")
+        self._set_status_text("context", server.context if server else "")
         self._set_status_text("path", server.project_path if server else "")
-        self._set_status_text("server", (f"Server PID {server.pid}" +
-            (f" | Profile {server.profile}" if server.profile else "")) if server else "")
+        self._set_status_text("server", str(server.pid) if server else "")
+        self._set_status_text("profile", server.profile or "" if server else "")
         proxies = [proxy for proxy in snapshot.proxies if proxy.server_key == server.key
                    and proxy.project_path == server.project_path] if server else []
         self._set_status_text("proxies", ", ".join(
-            str(proxy.pid) + (" (stale)" if proxy.state == "stale" else "") for proxy in proxies)
-            if proxies else ("None" if server else ""))
+            str(proxy.pid) + (" (갱신 지연)" if proxy.state == "stale" else "") for proxy in proxies)
+            if proxies else ("없음" if server else ""))
+        for key in ("context", "path_label", "path", "server_label", "server",
+                    "proxies_label", "proxies"):
+            user32.ShowWindow(self.status_controls[key], 5 if server else 0)
+        for key in ("profile_label", "profile"):
+            user32.ShowWindow(self.status_controls[key], 5 if server and server.profile else 0)
         user32.EnableWindow(self.status_controls["server_log"], server is not None)
+
+    def _draw_server_cell(self, lparam):
+        draw = ctypes.cast(lparam, ctypes.POINTER(NMLVCUSTOMDRAW)).contents
+        if draw.nmcd.dwDrawStage == 1:
+            return 0x20
+        if draw.nmcd.dwDrawStage == 0x10001:
+            return 0x20
+        if draw.nmcd.dwDrawStage != 0x30001:
+            return 0
+        column = draw.iSubItem
+        role = "emphasis" if column in (0, 5) else "technical" if column == 4 else "body"
+        gdi32.SelectObject(draw.nmcd.hdc, self.status_fonts[role])
+        contrast = HIGHCONTRAST(cbSize=ctypes.sizeof(HIGHCONTRAST))
+        user32.SystemParametersInfoW(0x0042, contrast.cbSize, ctypes.byref(contrast), 0)
+        if not contrast.dwFlags & 1 and not draw.nmcd.uItemState & 1:
+            draw.clrText = 0x807065 if column == 1 else 0x372A20
+            if column == 3:
+                server = self.displayed_snapshot.servers[self.server_rows[draw.nmcd.dwItemSpec]]
+                draw.clrText = 0x506E1D if server.state == "running" else 0x0C6096
+        return 2
 
     def status_window_proc(self, hwnd, message, wparam, lparam):
         try:
-            if message == WM_CTLCOLORSTATIC:
-                gdi32.SetBkColor(wparam, user32.GetSysColor(5))
-                return user32.GetSysColorBrush(5)
+            if message in (WM_ERASEBKGND, WM_CTLCOLORSTATIC):
+                contrast = HIGHCONTRAST(cbSize=ctypes.sizeof(HIGHCONTRAST))
+                user32.SystemParametersInfoW(0x0042, contrast.cbSize, ctypes.byref(contrast), 0)
+                inspector = lparam in {self.status_controls.get(key) for key in (
+                    "inspector", "selected", "context", "path_label", "server_label",
+                    "profile_label", "proxies_label", "server", "profile")}
+                paper = lparam in {self.status_controls.get(key) for key in (
+                    "path", "proxies", "diagnostics", "empty")}
+                background = (user32.GetSysColor(5) if contrast.dwFlags & 1 else
+                              0xFFFFFF if paper else 0xFCFAF9 if inspector else 0xF8F6F4)
+                brush = gdi32.GetStockObject(18)
+                gdi32.SetDCBrushColor(wparam, background)
+                if message == WM_ERASEBKGND:
+                    rect = w.RECT()
+                    user32.GetClientRect(hwnd, ctypes.byref(rect))
+                    user32.FillRect(wparam, ctypes.byref(rect), brush)
+                    return 1
+                foreground = user32.GetSysColor(8) if contrast.dwFlags & 1 else 0x372A20
+                if not contrast.dwFlags & 1:
+                    if lparam in (self.status_controls.get("summary"), self.status_controls.get("issues")):
+                        foreground = {"neutral": 0x807065, "active": 0x506E1D,
+                                       "attention": 0x0C6096}[icon_state(self.displayed_snapshot)]
+                    elif lparam in {self.status_controls.get(key) for key in (
+                        "context", "path_label", "server_label", "profile_label", "proxies_label",
+                        "server_count_label", "proxy_count_label", "observed", "reaper")}:
+                        foreground = 0x807065
+                gdi32.SetTextColor(wparam, foreground)
+                gdi32.SetBkColor(wparam, background)
+                return brush
             if message == WM_CLOSE:
                 user32.ShowWindow(hwnd, 0)
                 return 0
@@ -536,13 +728,16 @@ class Tray:
                 return 0
             if message == WM_NOTIFY and self.status_controls and not self._refreshing_status:
                 header = ctypes.cast(lparam, ctypes.POINTER(NMHDR)).contents
-                if (header.hwndFrom == self.status_controls["servers"]
-                        and header.code == ctypes.c_uint(-101).value):
-                    row = user32.SendMessageW(header.hwndFrom, LVM_GETNEXTITEM, -1, 2)
-                    self.selected_server_key = (self.displayed_snapshot.servers[self.server_rows[row]].key
-                        if 0 <= row < len(self.server_rows) else None)
-                    self._refresh_selection()
-                    return 0
+                if header.hwndFrom == self.status_controls["servers"]:
+                    if header.code == ctypes.c_uint(-12).value:
+                        return self._draw_server_cell(lparam)
+                    if header.code == ctypes.c_uint(-101).value:
+                        row = user32.SendMessageW(header.hwndFrom, LVM_GETNEXTITEM, -1, 2)
+                        self.selected_server_key = (self.displayed_snapshot.servers[self.server_rows[row]].key
+                            if 0 <= row < len(self.server_rows) else None)
+                        self._refresh_selection()
+                        self._layout_status()
+                        return 0
             if message == WM_COMMAND:
                 command = wparam & 0xFFFF
                 if command == 2 and not lparam:
@@ -554,9 +749,14 @@ class Tray:
                                    if server.key == self.selected_server_key), None)
                     if server:
                         self.open_path(pool.LOGS_DIR / f"serena-{server.key}.log")
+                elif command == TOGGLE_DIAGNOSTICS:
+                    self.diagnostics_expanded = not self.diagnostics_expanded
+                    self._set_status_text("diagnostic_toggle",
+                        "진단 접기" if self.diagnostics_expanded else "진단 보기")
+                    self._layout_status()
                 return 0
         except Exception:
-            logging.exception("Status window operation failed")
+            logging.exception("상태 창 작업 실패")
         return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
     def _destroy_status_window(self):
@@ -568,10 +768,10 @@ class Tray:
         self.selected_server_key = None
         self.server_rows.clear()
         self.status_dpi = 0
-        for font in (self.status_font, self.status_heading_font):
-            if font:
-                gdi32.DeleteObject(font)
-        self.status_font = self.status_heading_font = None
+        self.diagnostics_expanded = False
+        for font in self.status_fonts.values():
+            gdi32.DeleteObject(font)
+        self.status_fonts.clear()
         if self.row_images:
             comctl32.ImageList_Destroy(self.row_images)
             self.row_images = None
@@ -583,9 +783,9 @@ class Tray:
         data.hWnd, data.uID = self.hwnd, 1
         data.uFlags, data.uCallbackMessage = 7, WM_ICON
         data.hIcon = self.icons[icon_state(self.snapshot)]
-        data.szTip = ("Serena pool | " + summary(self.snapshot))[:127]
+        data.szTip = ("Serena Pool | " + summary(self.snapshot))[:127]
         if not shell32.Shell_NotifyIconW(1 if self.icon_added else 0, ctypes.byref(data)):
-            raise OSError("Windows could not update the Serena pool tray icon")
+            raise OSError("Serena Pool 트레이 아이콘을 갱신할 수 없습니다.")
         self.icon_added = True
 
     def sample(self):
@@ -593,7 +793,7 @@ class Tray:
             try:
                 snapshot = pool.read_pool_status()
             except Exception as exc:
-                logging.exception("Pool observation failed")
+                logging.exception("풀 상태 확인 실패")
                 snapshot = pool.PoolSnapshot(time.time(), (), (), "unreadable", (str(exc),))
             if self.stop.is_set():
                 return
@@ -624,7 +824,7 @@ class Tray:
                 user32.PostQuitMessage(0)
                 return 0
         except Exception:
-            logging.exception("Tray operation failed")
+            logging.exception("트레이 작업 실패")
         return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
     def run(self):
@@ -635,7 +835,7 @@ class Tray:
         if not user32.RegisterClassW(ctypes.byref(window_class)):
             raise ctypes.WinError(ctypes.get_last_error())
         try:
-            self.hwnd = user32.CreateWindowExW(0, name, "Serena pool observer", 0, 0, 0, 0, 0,
+            self.hwnd = user32.CreateWindowExW(0, name, "Serena Pool 관찰", 0, 0, 0, 0, 0,
                                              None, None, instance, None)
             if not self.hwnd:
                 raise ctypes.WinError(ctypes.get_last_error())
@@ -705,8 +905,8 @@ def main() -> int:
         Tray().run()
         return 0
     except Exception as exc:
-        logging.exception("Tray failed")
-        user32.MessageBoxW(None, str(exc), "Serena pool tray", 0x10)
+        logging.exception("트레이 시작 실패")
+        user32.MessageBoxW(None, f"트레이를 시작할 수 없습니다.\n\n{exc}", "Serena Pool 시작 실패", 0x10)
         return 1
     finally:
         if handle:

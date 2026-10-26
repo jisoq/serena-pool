@@ -126,7 +126,7 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.proxies[0].server_key, "pending")
         self.assertEqual(snapshot.reaper, "unreadable")
         self.assertEqual(len(snapshot.issues), 4)
-        self.assertIn("Incomplete observation", tray.summary(snapshot))
+        self.assertIn("일부 상태 확인 불가", tray.summary(snapshot))
 
     def test_unreadable_directory_is_incomplete(self):
         original = Path.iterdir
@@ -161,6 +161,9 @@ class NativeMenuTests(unittest.TestCase):
             ("GetMenuStringW", ctypes.c_int, [w.HMENU, w.UINT, w.LPWSTR, ctypes.c_int, w.UINT]),
             ("IsMenu", w.BOOL, [w.HMENU]),
             ("IsWindowEnabled", w.BOOL, [w.HWND]),
+            ("GetWindowLongW", w.LONG, [w.HWND, ctypes.c_int]),
+            ("GetWindowRect", w.BOOL, [w.HWND, ctypes.POINTER(w.RECT)]),
+            ("MapWindowPoints", ctypes.c_int, [w.HWND, w.HWND, ctypes.POINTER(w.POINT), w.UINT]),
         ):
             function = getattr(tray.user32, name)
             function.restype, function.argtypes = result, arguments
@@ -212,6 +215,13 @@ class NativeMenuTests(unittest.TestCase):
         tray.user32.SendMessageW(observer.status_controls["servers"], tray.LVM_FIRST + 43,
                                 row, ctypes.addressof(item))
 
+    def rect(self, observer, key):
+        rect = w.RECT()
+        self.assertTrue(tray.user32.GetWindowRect(observer.status_controls[key], ctypes.byref(rect)))
+        tray.user32.MapWindowPoints(None, observer.status_hwnd,
+            ctypes.cast(ctypes.byref(rect), ctypes.POINTER(w.POINT)), 2)
+        return rect
+
     def test_tray_menu_has_only_three_commands_and_releases_native_menu(self):
         observer = tray.Tray()
         captured = {}
@@ -219,8 +229,8 @@ class NativeMenuTests(unittest.TestCase):
         def select(menu, *args):
             captured["menu"] = menu
             self.assertEqual(self.contents(menu), [
-                ("Show status", tray.SHOW_STATUS), ("Open logs folder", tray.OPEN_LOGS),
-                ("Exit tray", tray.EXIT)])
+                ("상태 보기", tray.SHOW_STATUS), ("로그 폴더 열기", tray.OPEN_LOGS),
+                ("트레이 종료", tray.EXIT)])
             return tray.SHOW_STATUS
 
         with (patch.object(tray.user32, "TrackPopupMenu", side_effect=select),
@@ -235,22 +245,22 @@ class NativeMenuTests(unittest.TestCase):
         self.assertEqual(tray.user32.SendMessageW(observer.status_controls["servers"],
                                                  tray.LVM_FIRST + 4, 0, 0), 2)
         self.assertEqual([self.cell(observer, 0, column) for column in range(6)],
-                         ["same", "c:\\a&b", "codex", "Running", "24500", "1"])
+                         ["same", "c:\\a&b", "codex", "실행 중", "24500", "1"])
         self.assertEqual(self.cell(observer, 1, 1), "c:\\other")
         self.assertEqual(self.cell(observer, 1, 5), "0")
         self.assertEqual(self.text(observer.status_controls["path"]), snapshot.servers[0].project_path)
-        self.assertEqual(self.text(observer.status_controls["proxies"]), "333, 334 (stale)")
+        self.assertEqual(self.text(observer.status_controls["proxies"]), "333, 334 (갱신 지연)")
         diagnostic = self.text(observer.status_controls["diagnostics"])
-        self.assertIn("Pending connections", diagnostic)
-        self.assertIn("PID 335 (connected) | c:\\other\\same", diagnostic)
-        self.assertIn("PID 444 (connected) | c:\\pending", diagnostic)
-        self.assertIn("Read issue: unreadable test record", diagnostic)
-        self.assertIn("3 connected proxies", self.text(observer.status_controls["summary"]))
+        self.assertIn("연결 대기 2건", diagnostic)
+        self.assertIn("PID 335 (연결됨) | c:\\other\\same", diagnostic)
+        self.assertIn("PID 444 (연결됨) | c:\\pending", diagnostic)
+        self.assertIn("읽기 오류: unreadable test record", diagnostic)
+        self.assertEqual(self.text(observer.status_controls["proxy_count"]), "3")
         self.select(observer, 1)
         self.assertEqual(observer.selected_server_key, "second")
-        self.assertIn("Server PID 222 | Profile single-project",
-                      self.text(observer.status_controls["server"]))
-        self.assertEqual(self.text(observer.status_controls["proxies"]), "None")
+        self.assertEqual(self.text(observer.status_controls["server"]), "222")
+        self.assertEqual(self.text(observer.status_controls["profile"]), "single-project")
+        self.assertEqual(self.text(observer.status_controls["proxies"]), "없음")
 
     def test_native_selection_and_log_target_follow_displayed_snapshot(self):
         observer = self.observer(self.snapshot())
@@ -313,8 +323,8 @@ class NativeMenuTests(unittest.TestCase):
         self.assertEqual(tray.user32.SendMessageW(control, tray.LVM_FIRST + 4, 0, 0), 10)
         self.assertGreaterEqual(tray.user32.SendMessageW(control, tray.LVM_FIRST + 40, 0, 0), 10)
         self.assertTrue(all(self.cell(observer, row, 5) == "5" for row in range(10)))
-        self.assertIn("10 HTTP servers | 50 connected proxies",
-                      self.text(observer.status_controls["summary"]))
+        self.assertEqual(self.text(observer.status_controls["server_count"]), "10")
+        self.assertEqual(self.text(observer.status_controls["proxy_count"]), "50")
         self.select(observer, 9)
         before = tray.user32.SendMessageW(control, tray.LVM_FIRST + 39, 0, 0)
         observer.refresh_status(snapshot)
@@ -323,14 +333,112 @@ class NativeMenuTests(unittest.TestCase):
 
     def test_checking_and_incomplete_observations_do_not_appear_as_idle(self):
         observer = self.observer()
-        self.assertEqual(self.text(observer.status_controls["summary"]), "Checking pool")
+        self.assertEqual(self.text(observer.status_controls["summary"]), "상태 확인 중")
+        self.assertEqual(self.text(observer.status_controls["server_count"]), "확인 중")
+        self.assertEqual(self.text(observer.status_controls["proxy_count"]), "확인 중")
         unreadable = pool.PoolSnapshot(time.time(), (), (), "unreadable", ("access denied",))
         observer.refresh_status(unreadable)
-        self.assertIn("Attention | Incomplete observation",
+        self.assertIn("확인 필요 | 일부 상태 확인 불가",
                       self.text(observer.status_controls["summary"]))
         self.assertIn("access denied", self.text(observer.status_controls["diagnostics"]))
         empty = pool.PoolSnapshot(time.time(), (), (), "missing", ())
-        self.assertIn("Idle", tray.summary(empty))
+        self.assertIn("대기 중", tray.summary(empty))
+
+    def test_diagnostics_disclose_raw_records_and_reset_after_recovery(self):
+        observer = self.observer(self.snapshot())
+        controls = observer.status_controls
+        visible = 0x10000000
+        self.assertFalse(observer.diagnostics_expanded)
+        self.assertFalse(tray.user32.GetWindowLongW(controls["diagnostics"], -16) & visible)
+        self.assertTrue(tray.user32.GetWindowLongW(controls["diagnostic_toggle"], -16) & visible)
+        self.assertEqual(self.text(controls["issues"]), "연결 대기 2건 | 읽기 오류 1건")
+        observer.status_window_proc(observer.status_hwnd, tray.WM_COMMAND,
+                                    tray.TOGGLE_DIAGNOSTICS, controls["diagnostic_toggle"])
+        self.assertTrue(observer.diagnostics_expanded)
+        self.assertEqual(self.text(controls["diagnostic_toggle"]), "진단 접기")
+        self.assertTrue(tray.user32.GetWindowLongW(controls["diagnostics"], -16) & visible)
+        observer.refresh_status(pool.PoolSnapshot(time.time(), (), (), "missing", ()))
+        self.assertFalse(observer.diagnostics_expanded)
+        self.assertFalse(tray.user32.GetWindowLongW(controls["diagnostics"], -16) & visible)
+        self.assertFalse(tray.user32.GetWindowLongW(controls["diagnostic_toggle"], -16) & visible)
+        self.assertEqual(self.text(controls["diagnostics"]), "")
+        self.assertEqual(self.text(controls["empty"]), "등록된 서버가 없습니다.")
+
+    def test_korean_ui_preserves_literal_content_and_copyable_optional_fields(self):
+        path = "c:\\원본 & data\\" + "긴 프로젝트 경로\\" * 20 + "프로젝트 & tool"
+        context, profile = "Original & 컨텍스트", "profile-&-원본"
+        issue = "Raw read issue & 원본: C:\\data\\record.json"
+        snapshot = pool.PoolSnapshot(time.time(), (
+            pool.ServerStatus("key", path, context, profile, 24500, 123, "pid_unavailable"),
+        ), tuple(pool.ProxyStatus("key", path, 1000 + index, "connected")
+                 for index in range(19)), "pid_unavailable", (issue,))
+        observer = self.observer(snapshot)
+        controls = observer.status_controls
+        self.assertEqual(self.text(observer.status_hwnd), "Serena Pool 상태")
+        self.assertEqual(self.cell(observer, 0, 0), "프로젝트 & tool")
+        self.assertEqual(self.cell(observer, 0, 2), context)
+        self.assertEqual(self.cell(observer, 0, 3), "PID 확인 불가")
+        self.assertEqual(self.text(controls["path"]), path)
+        self.assertEqual(self.text(controls["context"]), context)
+        self.assertEqual(self.text(controls["profile"]), profile)
+        self.assertEqual(self.text(controls["proxies"]).split(", "),
+                         [str(1000 + index) for index in range(19)])
+        self.assertIn("읽기 오류: " + issue, self.text(controls["diagnostics"]))
+        self.assertEqual(self.text(controls["reaper"]), "정리 프로세스 PID 확인 불가")
+        for key in ("path", "server", "profile", "proxies"):
+            self.assertTrue(tray.user32.IsWindowEnabled(controls[key]))
+            self.assertTrue(tray.user32.GetWindowLongW(controls[key], -16) & 0x800)
+        self.assertGreaterEqual(self.rect(observer, "proxies").bottom -
+                                self.rect(observer, "proxies").top, 100)
+        server = snapshot.servers[0]
+        observer.refresh_status(pool.PoolSnapshot(time.time(), (
+            pool.ServerStatus(server.key, path, context, None, 24500, 123, "running"),
+        ), (), "running", ()))
+        self.assertFalse(tray.user32.GetWindowLongW(controls["profile"], -16) & 0x10000000)
+        self.assertFalse(tray.user32.GetWindowLongW(controls["profile_label"], -16) & 0x10000000)
+
+    def test_normal_and_minimum_layout_keep_visible_controls_reachable(self):
+        observer = self.observer(self.snapshot())
+        self.select(observer, 1)
+        scale = tray.user32.GetDpiForWindow(observer.status_hwnd) / 96
+        for width, height in ((1140, 720), (780, 480), (1140, 480), (780, 720),
+                              (1115, 602), (1115, 620), (1115, 650)):
+            for expanded in (False, True):
+                with self.subTest(width=width, height=height, expanded=expanded):
+                    observer.diagnostics_expanded = expanded
+                    tray.user32.SetWindowPos(observer.status_hwnd, None, 0, 0,
+                        round(width * scale), round(height * scale), 0x16)
+                    observer._layout_status()
+                    client = w.RECT()
+                    tray.user32.GetClientRect(observer.status_hwnd, ctypes.byref(client))
+                    for key, control in observer.status_controls.items():
+                        if not tray.user32.GetWindowLongW(control, -16) & 0x10000000:
+                            continue
+                        rect = self.rect(observer, key)
+                        self.assertGreater(rect.right, rect.left, key)
+                        self.assertGreater(rect.bottom, rect.top, key)
+                        self.assertGreaterEqual(rect.left, 0, key)
+                        self.assertGreaterEqual(rect.top, 0, key)
+                        self.assertLessEqual(rect.right, client.right, key)
+                        self.assertLessEqual(rect.bottom, client.bottom, key)
+                    table = self.rect(observer, "servers")
+                    panel = self.rect(observer, "inspector")
+                    self.assertGreaterEqual((table.bottom - table.top) / scale, 100)
+                    self.assertLessEqual(sum(tray.user32.SendMessageW(
+                        observer.status_controls["servers"], tray.LVM_FIRST + 29, column, 0)
+                        for column in range(6)), table.right - table.left)
+                    if panel.top > table.top:
+                        self.assertLess(table.bottom, panel.top)
+                        self.assertGreaterEqual((self.rect(observer, "path").bottom -
+                                                self.rect(observer, "path").top) / scale, 58)
+                        self.assertGreaterEqual((self.rect(observer, "proxies").bottom -
+                                                self.rect(observer, "proxies").top) / scale, 78)
+                    else:
+                        self.assertLess(table.right, panel.left)
+                    if expanded:
+                        diagnostics = self.rect(observer, "diagnostics")
+                        self.assertLessEqual(panel.bottom, diagnostics.top)
+                        self.assertLess(diagnostics.bottom, self.rect(observer, "observed").top)
 
     def test_status_close_and_escape_hide_without_stopping_observer(self):
         observer = self.observer(self.snapshot())
@@ -348,7 +456,8 @@ class NativeMenuTests(unittest.TestCase):
               patch.object(tray.user32, "SetFocus")):
             observer.show_status()
         self.assertEqual(observer.status_hwnd, handle)
-        shown.assert_called_once_with(handle, 5)
+        self.assertEqual([call.args for call in shown.call_args_list if call.args[0] == handle],
+                         [(handle, 5)])
 
     def test_left_click_opens_status_and_right_click_opens_menu(self):
         observer = tray.Tray()
@@ -368,7 +477,9 @@ class NativeMenuTests(unittest.TestCase):
                 tray.Tray().open_path(path)
             self.assertFalse(path.exists())
             opened.assert_not_called()
-            self.assertIn("does not exist", message.call_args.args[1])
+            self.assertIn("로그 경로가 없습니다.", message.call_args.args[1])
+            self.assertIn(str(path), message.call_args.args[1])
+            self.assertEqual(message.call_args.args[2], "로그 열기 실패")
 
     def test_singleton_is_per_pool_and_released_with_handle(self):
         with tempfile.TemporaryDirectory() as temp, patch.object(pool, "POOL_DIR", Path(temp)):
@@ -408,6 +519,11 @@ class NativeMenuTests(unittest.TestCase):
             if operation == 0:
                 observer._create_status_window()
                 handles.append(observer.status_hwnd)
+                self.assertEqual(tray.user32.SendMessageW(observer.status_hwnd, 0x007F, 0, 0),
+                                 observer.icons["attention"])
+                observer.refresh_status(pool.PoolSnapshot(time.time(), (), (), "missing", ()))
+                self.assertEqual(tray.user32.SendMessageW(observer.status_hwnd, 0x007F, 0, 0),
+                                 observer.icons["neutral"])
                 tray.user32.PostMessageW(observer.status_hwnd, tray.WM_KEYDOWN, 27, 0)
                 tray.user32.PostMessageW(observer.hwnd, tray.WM_CLOSE, 0, 0)
             return True
@@ -442,8 +558,7 @@ class NativeMenuTests(unittest.TestCase):
         handles = [observer.status_hwnd, *observer.status_controls.values()]
         observer._destroy_status_window()
         self.assertTrue(all(not tray.user32.IsWindow(handle) for handle in handles))
-        self.assertIsNone(observer.status_font)
-        self.assertIsNone(observer.status_heading_font)
+        self.assertEqual(observer.status_fonts, {})
         self.assertIsNone(observer.row_images)
 
     def test_exit_and_explorer_restart_do_not_control_backend(self):
