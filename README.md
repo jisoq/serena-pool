@@ -68,6 +68,39 @@ or clone and install into an independent uv tool environment:
     git clone https://github.com/svetkis/serena-pool
     uv tool install ./serena-pool
 
+## Observe the pool from the Windows tray
+
+Run `serena-pool-tray` from the same installation as `serena-pool`. The observer starts
+explicitly and allows one instance per pool. Hover over its icon
+for observed HTTP server and connected proxy counts. Click either mouse button to open
+the project menus. Project names keep the main menu compact. Each submenu shows the full
+path. Equal project names include their full paths in the main menu. The menus show context,
+port, server PID, proxy PIDs, and an action to open each server log.
+**Open logs folder** opens the existing pool logs. **Exit tray** leaves the pool running.
+
+The observer reads the existing registry and leases immediately, then waits five seconds
+between observations. An HTTP server counts when its PID is available and a bounded TCP
+connection succeeds. **PID unavailable** also covers processes Windows will not let the
+observer inspect. **Port unavailable** reports the connection check, not application health.
+A proxy counts when its PID is available and its heartbeat is at most 90 seconds old.
+Each proxy PID counts once, under its newest lease. Unassociated leases appear under
+**Pending connections**. These observations do not measure named agents, busy work, or
+MCP session health.
+
+A gray icon indicates an empty pool or the initial observation. Green indicates activity.
+Amber indicates unavailable records, stale proxies, a missing reaper for an active pool,
+or a read issue. Malformed or inaccessible files produce **Incomplete observation** counts;
+valid records remain visible. The menu includes the observation age and reaper state.
+Opening a menu preserves that observation and its log targets until the menu closes.
+
+The observer does not start servers or the reaper. Reading an empty pool creates no
+backend state. Starting the tray can create its `logs/` directory and `logs/tray.log` for
+observer failures. Opening a missing log reports the error without creating the file.
+No extra dependencies are required.
+
+Run the observer regression tests with `python -m unittest discover -s tests -p test_tray.py -v`.
+These tests inspect native Windows menu content without leaving a tray process running.
+
 ## Client configuration
 
 Codex (`~/.codex/config.toml`):
