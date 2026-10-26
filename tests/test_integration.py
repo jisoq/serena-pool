@@ -11,12 +11,14 @@ from pathlib import Path
 import queue
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 if os.name != "nt":
     raise unittest.SkipTest("serena-pool currently supports Windows only")
@@ -99,7 +101,6 @@ class LiveIsolationTests(unittest.TestCase):
         pool_dir.mkdir(parents=True)
         config = {**pool.DEFAULT_CONFIG, "serena_exe": serena,
                   "extra_args": ["--enable-web-dashboard=false", "--open-web-dashboard=false"]}
-        (pool_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
         (home / ".serena/serena_config.yml").write_text(pool.yaml.safe_dump({
             "projects": [], "language_backend": "LSP", "agent_interface": "REPL",
             "web_dashboard": False, "gui_log_window": False,
@@ -124,7 +125,7 @@ class LiveIsolationTests(unittest.TestCase):
 
         def entry(project):
             return next(e for p in (pool_dir / "registry").glob("*.json")
-                        if (e := json.loads(p.read_text(encoding="utf-8")))["project_path"] == str(project))
+                        if (e := json.loads(p.read_text(encoding="utf-8")))["project_path"] == str(project) and pool.pid_alive(e["pid"]))
 
         def code(client, session, source):
             result = client.call("serena_repl", {"session": session, "code": source})
@@ -139,16 +140,45 @@ class LiveIsolationTests(unittest.TestCase):
                 time.sleep(0.2)
             self.fail(f"Condition was not met within {timeout}s; state retained at {home}")
 
+        blocker = socket.socket()
         try:
+            with patch.dict(os.environ, {"SERENA_POOL_CONTEXT": ""}):
+                for port_base in range(37000, 45000, config["port_range"]):
+                    config["port_base"] = port_base
+                    blocked_port = next(pool.port_candidates(projects[0], config))[1]
+                    try:
+                        blocker.bind(("127.0.0.1", blocked_port))
+                    except OSError:
+                        continue
+                    break
+                else:
+                    self.fail("No free first candidate for the warm reuse test")
+            blocker.listen()
+            (pool_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            warm_client = Client(command, projects[0], env, home / "warm-client.log")
+            clients.append(warm_client)
+            warm_client.initialize()
+            warm = entry(projects[0])
+            self.assertNotEqual(warm["port"], blocked_port)
+            self.assertEqual(len(list((pool_dir / "registry").glob("*.json"))), 1)
+            warm_client.close()
+            clients.remove(warm_client)
+            blocker.close()
+            self.assertTrue(pool.pid_alive(warm["pid"]))
+            self.assertFalse(pool.tcp_alive(blocked_port))
+
             for i, project in enumerate((projects[0], projects[0], projects[1])):
                 client = Client(command, project, env, home / f"client-{i}.log")
                 clients.append(client)
                 client.sid = client.initialize()
             first, second, third = clients
             alpha, beta = entry(projects[0]), entry(projects[1])
+            self.assertEqual(alpha["pid"], warm["pid"])
+            self.assertEqual(alpha["port"], warm["port"])
             self.assertNotEqual(alpha["pid"], beta["pid"])
             self.assertNotEqual(alpha["port"], beta["port"])
             self.assertEqual(len(list((pool_dir / "registry").glob("*.json"))), 2)
+            print("PASS: reconnect reuses the later candidate after the earlier port is freed", flush=True)
             self.assertEqual(code(second, second.sid, 'marker = "alpha-client"\nmarker'), "alpha-client")
             self.assertEqual(code(third, third.sid, 'marker = "beta-client"\nmarker'), "beta-client")
             find = 's.lsp.find_symbol("identity", relative_path="sample.py", include_body=True)'
@@ -250,6 +280,7 @@ class LiveIsolationTests(unittest.TestCase):
             print("PASS: default TOOLS interface routes projects without a REPL session argument", flush=True)
             completed = True
         finally:
+            blocker.close()
             for client in clients:
                 client.close()
             for path in (pool_dir / "registry").glob("*.json"):
