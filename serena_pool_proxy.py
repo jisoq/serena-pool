@@ -336,7 +336,18 @@ def _spawn_serena(project_path: Path, key: str, port: int, cfg: dict) -> dict:
 
 def ensure_server(project_path: Path, cfg: dict, force_restart: bool = False) -> dict:
     """Гарантирует живую Serena для проекта. Возвращает registry entry."""
-    for key, port in port_candidates(project_path, cfg):
+    candidates = list(port_candidates(project_path, cfg))
+    if not force_restart:
+        for key, _ in candidates:
+            with file_lock(key):
+                entry = read_registry(key)
+                if (entry
+                        and norm_path(entry.get("project_path", "")) == norm_path(project_path)
+                        and entry.get("context", "codex") == resolve_context(cfg)
+                        and pid_alive(entry["pid"])
+                        and tcp_alive(entry["port"])):
+                    return entry
+    for key, port in candidates:
         existing = read_registry(key)
         if existing and (norm_path(existing.get("project_path", "")) != norm_path(project_path)
                          or existing.get("context", "codex") != resolve_context(cfg)):

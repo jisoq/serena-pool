@@ -87,6 +87,7 @@ class PoolRegressionTests(unittest.TestCase):
                     with (
                         patch.object(pool, "REGISTRY_DIR", directory),
                         patch.object(pool, "LOCKS_DIR", directory),
+                        patch.object(pool, "kill_tree"),
                         patch.object(pool, "pid_alive", side_effect=lambda pid: pid != 1234 or case != "dead_pid"),
                         patch.object(pool, "_spawn_serena", return_value=spawned) as spawn,
                         patch.object(pool, "tcp_alive", side_effect=lambda p: (p == port and case != "closed_port") or spawn.called),
