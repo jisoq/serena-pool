@@ -46,6 +46,78 @@ class PoolRegressionTests(unittest.TestCase):
         self.assertEqual(len({port for _, port in candidates}), 3)
         self.assertTrue(all(24500 <= port < 24503 for _, port in candidates))
 
+    def test_reconnect_reuses_later_candidate_when_earlier_port_is_free(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            cfg = {**pool.DEFAULT_CONFIG, "port_range": 2}
+            project = directory / "project"
+            with patch.dict(os.environ, {"SERENA_POOL_CONTEXT": ""}):
+                candidates = list(pool.port_candidates(project, cfg))
+                key, port = candidates[1]
+                warm = {"key": key, "project_path": str(project), "context": cfg["context"],
+                        "port": port, "pid": 1234}
+                spawned = {**warm, "key": candidates[0][0], "port": candidates[0][1], "pid": 5678}
+                with (
+                    patch.object(pool, "REGISTRY_DIR", directory),
+                    patch.object(pool, "LOCKS_DIR", directory),
+                    patch.object(pool, "pid_alive", return_value=True),
+                    patch.object(pool, "_spawn_serena", return_value=spawned) as spawn,
+                    patch.object(pool, "tcp_alive", side_effect=lambda p: p == port or spawn.called),
+                ):
+                    pool.write_registry(key, warm)
+                    self.assertEqual(pool.ensure_server(project, cfg), warm)
+
+    def test_reconnect_does_not_reuse_mismatched_or_stale_candidate(self):
+        for case in ("project", "context", "dead_pid", "closed_port"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as temp:
+                directory = Path(temp)
+                cfg = {**pool.DEFAULT_CONFIG, "port_range": 2}
+                project = directory / "project"
+                with patch.dict(os.environ, {"SERENA_POOL_CONTEXT": ""}):
+                    candidates = list(pool.port_candidates(project, cfg))
+                    key, port = candidates[1]
+                    warm = {"key": key, "project_path": str(project), "context": cfg["context"],
+                            "port": port, "pid": 1234}
+                    if case == "project":
+                        warm["project_path"] = str(directory / "other")
+                    if case == "context":
+                        warm["context"] = "other"
+                    spawned = {"key": candidates[0][0], "project_path": str(project),
+                               "context": cfg["context"], "port": candidates[0][1], "pid": 5678}
+                    with (
+                        patch.object(pool, "REGISTRY_DIR", directory),
+                        patch.object(pool, "LOCKS_DIR", directory),
+                        patch.object(pool, "pid_alive", side_effect=lambda pid: pid != 1234 or case != "dead_pid"),
+                        patch.object(pool, "_spawn_serena", return_value=spawned) as spawn,
+                        patch.object(pool, "tcp_alive", side_effect=lambda p: (p == port and case != "closed_port") or spawn.called),
+                    ):
+                        pool.write_registry(key, warm)
+                        self.assertEqual(pool.ensure_server(project, cfg), spawned)
+
+    def test_force_restart_replaces_a_live_server(self):
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            cfg = {**pool.DEFAULT_CONFIG, "port_range": 1}
+            project = directory / "project"
+            with patch.dict(os.environ, {"SERENA_POOL_CONTEXT": ""}):
+                key, port = next(pool.port_candidates(project, cfg))
+                warm = {"key": key, "project_path": str(project), "context": cfg["context"],
+                        "port": port, "pid": 1234}
+                spawned = {**warm, "pid": 5678}
+                with (
+                    patch.object(pool, "REGISTRY_DIR", directory),
+                    patch.object(pool, "LOCKS_DIR", directory),
+                    patch.object(pool, "pid_alive", return_value=True),
+                    patch.object(pool, "tcp_alive", return_value=True),
+                    patch.object(pool, "_spawn_serena", return_value=spawned),
+                    patch.object(pool, "kill_tree") as kill,
+                    patch.object(pool.time, "sleep"),
+                    patch.object(pool, "log"),
+                ):
+                    pool.write_registry(key, warm)
+                    self.assertEqual(pool.ensure_server(project, cfg, force_restart=True), spawned)
+                    kill.assert_called_once_with(warm["pid"])
+
     def test_context_copy_preserves_user_options_without_modifying_source(self):
         with tempfile.TemporaryDirectory() as temp:
             directory = Path(temp)
