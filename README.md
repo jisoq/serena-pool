@@ -72,10 +72,11 @@ or clone and install into an independent uv tool environment:
 
 Run `serena-pool-tray` from the same installation as `serena-pool`. The observer starts
 explicitly and allows one instance per pool. Hover over its icon
-for observed HTTP server and connected proxy counts. Click either mouse button to open
-the project menus. Project names keep the main menu compact. Each submenu shows the full
-path. Equal project names include their full paths in the main menu. The menus show context,
-port, server PID, proxy PIDs, and an action to open each server log.
+for observed HTTP server and connected proxy counts. Left-click to open the native status
+window. Compare project, location, context, status, port, and connected proxies in one table.
+Select a server to copy its full path and proxy PIDs, inspect its server PID and profile,
+or open its log. Right-click for **Show status**, **Open logs folder**, and **Exit tray**.
+Close the window or press Escape to hide it. Launch the observer again to reopen its window.
 **Open logs folder** opens the existing pool logs. **Exit tray** leaves the pool running.
 
 The observer reads the existing registry and leases immediately, then waits five seconds
@@ -84,14 +85,15 @@ connection succeeds. **PID unavailable** also covers processes Windows will not 
 observer inspect. **Port unavailable** reports the connection check, not application health.
 A proxy counts when its PID is available and its heartbeat is at most 90 seconds old.
 Each proxy PID counts once, under its newest lease. Unassociated leases appear under
-**Pending connections**. These observations do not measure named agents, busy work, or
-MCP session health.
+**Pending connections** in the diagnostic area below the selected server. These observations
+do not measure named agents, busy work, or MCP session health.
 
 A gray icon indicates an empty pool or the initial observation. Green indicates activity.
 Amber indicates unavailable records, stale proxies, a missing reaper for an active pool,
 or a read issue. Malformed or inaccessible files produce **Incomplete observation** counts;
-valid records remain visible. The menu includes the observation age and reaper state.
-Opening a menu preserves that observation and its log targets until the menu closes.
+valid records remain visible. The window includes the observation age, reaper state, and read
+issues. Rows and details use the same observation. Refresh preserves the selected server
+while it remains in the pool.
 
 The observer does not start servers or the reaper. Reading an empty pool creates no
 backend state. Starting the tray can create its `logs/` directory and `logs/tray.log` for
@@ -99,7 +101,7 @@ observer failures. Opening a missing log reports the error without creating the 
 No extra dependencies are required.
 
 Run the observer regression tests with `python -m unittest discover -s tests -p test_tray.py -v`.
-These tests inspect native Windows menu content without leaving a tray process running.
+These tests inspect native Windows controls without leaving a visible window or tray process running.
 
 ## Client configuration
 

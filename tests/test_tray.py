@@ -160,6 +160,7 @@ class NativeMenuTests(unittest.TestCase):
             ("GetMenuItemID", w.UINT, [w.HMENU, ctypes.c_int]),
             ("GetMenuStringW", ctypes.c_int, [w.HMENU, w.UINT, w.LPWSTR, ctypes.c_int, w.UINT]),
             ("IsMenu", w.BOOL, [w.HMENU]),
+            ("IsWindowEnabled", w.BOOL, [w.HWND]),
         ):
             function = getattr(tray.user32, name)
             function.restype, function.argtypes = result, arguments
@@ -169,68 +170,195 @@ class NativeMenuTests(unittest.TestCase):
         for position in range(tray.user32.GetMenuItemCount(menu)):
             text = ctypes.create_unicode_buffer(4096)
             tray.user32.GetMenuStringW(menu, position, text, len(text), 0x400)
+            self.assertFalse(tray.user32.GetSubMenu(menu, position))
             result.append((text.value, tray.user32.GetMenuItemID(menu, position)))
-            child = tray.user32.GetSubMenu(menu, position)
-            if child:
-                result.extend(self.contents(child))
         return result
 
     def snapshot(self):
         return pool.PoolSnapshot(time.time(), (
             pool.ServerStatus("first", r"c:\a&b\same", "codex", None, 24500, 111, "running"),
-            pool.ServerStatus("second", r"c:\other\same", "zcode", "single-project", 24501, 222, "port_unavailable"),
+            pool.ServerStatus("second", r"c:\other\same", "zcode", "single-project",
+                              24501, 222, "port_unavailable"),
         ), (
             pool.ProxyStatus("first", r"c:\a&b\same", 333, "connected"),
+            pool.ProxyStatus("first", r"c:\a&b\same", 334, "stale"),
+            pool.ProxyStatus("first", r"c:\other\same", 335, "connected"),
             pool.ProxyStatus("missing", r"c:\pending", 444, "connected"),
-        ), "running", ())
+        ), "running", ("unreadable test record",))
 
-    def test_native_menu_content_and_log_targets_survive_snapshot_refresh(self):
+    def observer(self, snapshot=None):
         observer = tray.Tray()
-        observer.snapshot = self.snapshot()
+        observer.snapshot = snapshot
+        observer._create_status_window()
+        self.addCleanup(observer._destroy_status_window)
+        self.assertFalse(tray.user32.IsWindowVisible(observer.status_hwnd))
+        return observer
+
+    def text(self, handle):
+        text = ctypes.create_unicode_buffer(tray.user32.GetWindowTextLengthW(handle) + 1)
+        tray.user32.GetWindowTextW(handle, text, len(text))
+        return text.value
+
+    def cell(self, observer, row, column):
+        text = ctypes.create_unicode_buffer(4096)
+        item = tray.LVITEM(iSubItem=column, pszText=ctypes.cast(text, w.LPWSTR),
+                           cchTextMax=len(text))
+        tray.user32.SendMessageW(observer.status_controls["servers"], tray.LVM_FIRST + 115,
+                                row, ctypes.addressof(item))
+        return text.value
+
+    def select(self, observer, row):
+        item = tray.LVITEM(state=3, stateMask=3)
+        tray.user32.SendMessageW(observer.status_controls["servers"], tray.LVM_FIRST + 43,
+                                row, ctypes.addressof(item))
+
+    def test_tray_menu_has_only_three_commands_and_releases_native_menu(self):
+        observer = tray.Tray()
         captured = {}
 
         def select(menu, *args):
             captured["menu"] = menu
-            rows = self.contents(menu)
-            labels = [label for label, _ in rows]
-            self.assertIn(r"c:\a&&b\same (1 connected proxies)", labels)
-            self.assertIn(r"c:\other\same (0 connected proxies)", labels)
-            self.assertIn("codex / port 24500", labels)
-            self.assertIn("Status: port unavailable", labels)
-            self.assertIn("Server PID: 111", labels)
-            self.assertIn("Proxy PID 333: connected", labels)
-            self.assertIn("Pending connections", labels)
-            self.assertIn(r"c:\pending / proxy PID 444: connected", labels)
-            observer.snapshot = pool.PoolSnapshot(time.time(), (), (), "missing", ())
-            return next(command for label, command in rows if label == "Open server log")
+            self.assertEqual(self.contents(menu), [
+                ("Show status", tray.SHOW_STATUS), ("Open logs folder", tray.OPEN_LOGS),
+                ("Exit tray", tray.EXIT)])
+            return tray.SHOW_STATUS
 
         with (patch.object(tray.user32, "TrackPopupMenu", side_effect=select),
-              patch.object(observer, "open_path") as opened):
+              patch.object(observer, "show_status") as shown):
             observer.show_menu()
-        opened.assert_called_once_with(pool.LOGS_DIR / "serena-first.log")
+        shown.assert_called_once_with()
         self.assertFalse(tray.user32.IsMenu(captured["menu"]))
 
-    def test_unique_project_name_is_compact_and_full_path_remains_available(self):
-        project = r"c:\long\nested\프로젝트&tools"
-        snapshot = pool.PoolSnapshot(time.time(), (
-            pool.ServerStatus("unique", project, "codex", None, 24500, 111, "running"),
-        ), (), "running", ())
-        menu, _ = tray.Tray().build_menu(snapshot)
-        try:
-            labels = [label for label, _ in self.contents(menu)]
-            self.assertIn("프로젝트&&tools (0 connected proxies)", labels)
-            self.assertIn(project.replace("&", "&&"), labels)
-        finally:
-            tray.user32.DestroyMenu(menu)
+    def test_native_rows_details_and_diagnostics_keep_exact_associations(self):
+        snapshot = self.snapshot()
+        observer = self.observer(snapshot)
+        self.assertEqual(tray.user32.SendMessageW(observer.status_controls["servers"],
+                                                 tray.LVM_FIRST + 4, 0, 0), 2)
+        self.assertEqual([self.cell(observer, 0, column) for column in range(6)],
+                         ["same", "c:\\a&b", "codex", "Running", "24500", "1"])
+        self.assertEqual(self.cell(observer, 1, 1), "c:\\other")
+        self.assertEqual(self.cell(observer, 1, 5), "0")
+        self.assertEqual(self.text(observer.status_controls["path"]), snapshot.servers[0].project_path)
+        self.assertEqual(self.text(observer.status_controls["proxies"]), "333, 334 (stale)")
+        diagnostic = self.text(observer.status_controls["diagnostics"])
+        self.assertIn("Pending connections", diagnostic)
+        self.assertIn("PID 335 (connected) | c:\\other\\same", diagnostic)
+        self.assertIn("PID 444 (connected) | c:\\pending", diagnostic)
+        self.assertIn("Read issue: unreadable test record", diagnostic)
+        self.assertIn("3 connected proxies", self.text(observer.status_controls["summary"]))
+        self.select(observer, 1)
+        self.assertEqual(observer.selected_server_key, "second")
+        self.assertIn("Server PID 222 | Profile single-project",
+                      self.text(observer.status_controls["server"]))
+        self.assertEqual(self.text(observer.status_controls["proxies"]), "None")
 
-    def test_status_text_distinguishes_idle_and_attention_with_zero_counts(self):
+    def test_native_selection_and_log_target_follow_displayed_snapshot(self):
+        observer = self.observer(self.snapshot())
+        self.select(observer, 1)
+        observer.snapshot = pool.PoolSnapshot(time.time(), (), (), "missing", ())
+        with patch.object(observer, "open_path") as opened:
+            observer.status_window_proc(observer.status_hwnd, 0x0111, tray.OPEN_SERVER_LOG,
+                                        observer.status_controls["server_log"])
+        opened.assert_called_once_with(pool.LOGS_DIR / "serena-second.log")
+        previous = observer.displayed_snapshot
+        changed = pool.PoolSnapshot(time.time(), tuple(reversed(previous.servers)),
+                                    previous.proxies, "running", ())
+        focus = tray.user32.GetFocus()
+        observer.refresh_status(changed)
+        self.assertIs(observer.displayed_snapshot, changed)
+        self.assertEqual(observer.selected_server_key, "second")
+        self.assertEqual(tray.user32.GetFocus(), focus)
+        self.assertEqual(self.text(observer.status_controls["path"]), previous.servers[1].project_path)
+        inserted = pool.ServerStatus("new", r"c:\new\aaa", "codex", None, 24502, 999, "running")
+        observer.refresh_status(pool.PoolSnapshot(time.time(), (inserted, *previous.servers),
+                                                  previous.proxies, "running", ()))
+        self.assertEqual(observer.selected_server_key, "second")
+        self.assertEqual(self.text(observer.status_controls["path"]), previous.servers[1].project_path)
+        observer.refresh_status(pool.PoolSnapshot(time.time(), (previous.servers[0],), (),
+                                                  "running", ()))
+        self.assertIsNone(observer.selected_server_key)
+        self.assertEqual(self.text(observer.status_controls["path"]), "")
+        self.assertEqual(self.text(observer.status_controls["proxies"]), "")
+        self.assertFalse(tray.user32.IsWindowEnabled(observer.status_controls["server_log"]))
+        with patch.object(observer, "open_path") as opened:
+            observer.status_window_proc(observer.status_hwnd, 0x0111, tray.OPEN_SERVER_LOG,
+                                        observer.status_controls["server_log"])
+        opened.assert_not_called()
+
+    def test_long_unicode_paths_stay_in_copyable_details_and_distinct_locations(self):
+        paths = [r"c:\long\nested\one\shared\프로젝트&tools",
+                 r"c:\long\nested\two\shared\프로젝트&tools"]
+        snapshot = pool.PoolSnapshot(time.time(), tuple(
+            pool.ServerStatus(str(index), path, "codex", None, 24500 + index, 111 + index,
+                              "running") for index, path in enumerate(paths)),
+            (), "running", ())
+        observer = self.observer(snapshot)
+        self.assertEqual(self.cell(observer, 0, 0), "프로젝트&tools")
+        self.assertEqual(self.cell(observer, 0, 1), r"one\shared")
+        self.assertEqual(self.cell(observer, 1, 1), r"two\shared")
+        self.assertEqual(self.text(observer.status_controls["path"]), paths[0])
+        self.select(observer, 1)
+        self.assertEqual(self.text(observer.status_controls["path"]), paths[1])
+
+    def test_ten_servers_fifty_proxies_fit_in_normal_native_grid(self):
+        snapshot = pool.PoolSnapshot(time.time(), tuple(
+            pool.ServerStatus(str(index), rf"c:\worktrees\task-{index}\project", "codex",
+                              None, 24500 + index, 100 + index, "running")
+            for index in range(10)), tuple(
+            pool.ProxyStatus(str(index), rf"c:\worktrees\task-{index}\project",
+                             1000 + index * 5 + proxy, "connected")
+            for index in range(10) for proxy in range(5)), "running", ())
+        observer = self.observer(snapshot)
+        control = observer.status_controls["servers"]
+        self.assertEqual(tray.user32.SendMessageW(control, tray.LVM_FIRST + 4, 0, 0), 10)
+        self.assertGreaterEqual(tray.user32.SendMessageW(control, tray.LVM_FIRST + 40, 0, 0), 10)
+        self.assertTrue(all(self.cell(observer, row, 5) == "5" for row in range(10)))
+        self.assertIn("10 HTTP servers | 50 connected proxies",
+                      self.text(observer.status_controls["summary"]))
+        self.select(observer, 9)
+        before = tray.user32.SendMessageW(control, tray.LVM_FIRST + 39, 0, 0)
+        observer.refresh_status(snapshot)
+        self.assertEqual(observer.selected_server_key, "9")
+        self.assertEqual(tray.user32.SendMessageW(control, tray.LVM_FIRST + 39, 0, 0), before)
+
+    def test_checking_and_incomplete_observations_do_not_appear_as_idle(self):
+        observer = self.observer()
+        self.assertEqual(self.text(observer.status_controls["summary"]), "Checking pool")
+        unreadable = pool.PoolSnapshot(time.time(), (), (), "unreadable", ("access denied",))
+        observer.refresh_status(unreadable)
+        self.assertIn("Attention | Incomplete observation",
+                      self.text(observer.status_controls["summary"]))
+        self.assertIn("access denied", self.text(observer.status_controls["diagnostics"]))
         empty = pool.PoolSnapshot(time.time(), (), (), "missing", ())
-        unavailable = pool.PoolSnapshot(time.time(), (
-            pool.ServerStatus("unavailable", r"c:\project", "codex", None, 24500, 111, "pid_unavailable"),
-        ), (), "missing", ())
         self.assertIn("Idle", tray.summary(empty))
-        self.assertIn("Attention", tray.summary(unavailable))
-        self.assertEqual((empty.server_count, unavailable.server_count), (0, 0))
+
+    def test_status_close_and_escape_hide_without_stopping_observer(self):
+        observer = self.observer(self.snapshot())
+        handle = observer.status_hwnd
+        with patch.object(tray.user32, "PostQuitMessage") as quit_message:
+            observer.status_window_proc(handle, tray.WM_CLOSE, 0, 0)
+            observer.status_window_proc(handle, 0x0111, 2, 0)
+        self.assertTrue(tray.user32.IsWindow(handle))
+        self.assertFalse(tray.user32.IsWindowVisible(handle))
+        self.assertFalse(observer.stop.is_set())
+        quit_message.assert_not_called()
+        with (patch.object(tray.user32, "ShowWindow") as shown,
+              patch.object(tray.user32, "SetWindowPos"),
+              patch.object(tray.user32, "SetForegroundWindow"),
+              patch.object(tray.user32, "SetFocus")):
+            observer.show_status()
+        self.assertEqual(observer.status_hwnd, handle)
+        shown.assert_called_once_with(handle, 5)
+
+    def test_left_click_opens_status_and_right_click_opens_menu(self):
+        observer = tray.Tray()
+        with (patch.object(observer, "show_status") as status,
+              patch.object(observer, "show_menu") as menu):
+            observer.window_proc(None, tray.WM_ICON, 0, 0x0202)
+            status.assert_called_once_with()
+            menu.assert_not_called()
+            observer.window_proc(None, tray.WM_ICON, 0, 0x0205)
+            menu.assert_called_once_with()
 
     def test_missing_log_is_reported_without_creating_it(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -258,11 +386,44 @@ class NativeMenuTests(unittest.TestCase):
             self.assertIsNotNone(replacement)
             tray.kernel32.CloseHandle(replacement)
 
+    def test_second_launch_requests_existing_native_status(self):
+        with (tempfile.TemporaryDirectory() as temp, patch.object(pool, "POOL_DIR", Path(temp)),
+              patch.object(tray.user32, "FindWindowW", return_value=1234),
+              patch.object(tray.user32, "GetWindowThreadProcessId"),
+              patch.object(tray.user32, "AllowSetForegroundWindow"),
+              patch.object(tray.user32, "PostMessageW") as posted):
+            first = tray.acquire_singleton()
+            try:
+                self.assertIsNone(tray.acquire_singleton())
+                posted.assert_called_once_with(1234, tray.WM_SHOW_STATUS, 0, 0)
+            finally:
+                tray.kernel32.CloseHandle(first)
+
+    def test_message_loop_routes_status_escape_with_native_msg(self):
+        observer = tray.Tray()
+        observer.snapshot = self.snapshot()
+        handles = []
+
+        def notify(operation, data):
+            if operation == 0:
+                observer._create_status_window()
+                handles.append(observer.status_hwnd)
+                tray.user32.PostMessageW(observer.status_hwnd, tray.WM_KEYDOWN, 27, 0)
+                tray.user32.PostMessageW(observer.hwnd, tray.WM_CLOSE, 0, 0)
+            return True
+
+        with (patch.object(observer, "sample", return_value=None),
+              patch.object(tray.shell32, "Shell_NotifyIconW", side_effect=notify),
+              patch.object(tray.user32, "ShowWindow", wraps=tray.user32.ShowWindow) as shown):
+            observer.run()
+        self.assertEqual(len(handles), 1)
+        shown.assert_any_call(handles[0], 0)
+        self.assertFalse(tray.user32.IsWindow(handles[0]))
+        self.assertFalse(observer.worker.is_alive())
+
     def test_hidden_native_window_exits_and_releases_resources(self):
         observer = tray.Tray()
         handles = []
-        tray.user32.IsWindow.argtypes = [w.HWND]
-        tray.user32.IsWindow.restype = w.BOOL
 
         def close_window():
             handles.append(observer.hwnd)
@@ -275,6 +436,15 @@ class NativeMenuTests(unittest.TestCase):
         self.assertFalse(tray.user32.IsWindow(handles[0]))
         self.assertFalse(observer.worker.is_alive())
         self.assertTrue(observer.stop.is_set())
+
+    def test_status_resources_are_destroyed_with_the_observer(self):
+        observer = self.observer(self.snapshot())
+        handles = [observer.status_hwnd, *observer.status_controls.values()]
+        observer._destroy_status_window()
+        self.assertTrue(all(not tray.user32.IsWindow(handle) for handle in handles))
+        self.assertIsNone(observer.status_font)
+        self.assertIsNone(observer.status_heading_font)
+        self.assertIsNone(observer.row_images)
 
     def test_exit_and_explorer_restart_do_not_control_backend(self):
         observer = tray.Tray()
