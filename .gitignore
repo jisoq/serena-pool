@@ -5,3 +5,5 @@ dist/
 build/
 *.egg-info/
 uv.lock
+.serena/*
+!.serena/project.yml
